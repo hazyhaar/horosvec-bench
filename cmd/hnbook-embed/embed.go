@@ -42,6 +42,12 @@ type embedRequest struct {
 	Model      string   `json:"model"`
 	Input      []string `json:"input"`
 	Dimensions *int     `json:"dimensions,omitempty"`
+	// TruncatePromptTokens fait tronquer PAR LE SERVEUR (vLLM) tout texte au-delà de
+	// N tokens. Indispensable : le plafond client en octets (maxTextBytes) ne borne pas
+	// les tokens — un texte HN saturé d'entités HTML dépasse 8192 tokens sous 24k octets
+	// (incident run 26,7M du 2026-07-08, HTTP 400 à 465k docs). Vérifié par sonde :
+	// input 9000 mots → usage.prompt_tokens = 8192, embedding rendu.
+	TruncatePromptTokens int `json:"truncate_prompt_tokens,omitempty"`
 }
 
 type embedResponseItem struct {
@@ -57,7 +63,7 @@ type embedResponse struct {
 // réponse (l'ordre du tableau data n'est pas contractuel). Back-off borné sur 429, fail-loud
 // sur tout autre statut ou toute incohérence de forme.
 func (c *embedClient) embedBatch(ctx context.Context, texts []string) ([][]float32, error) {
-	reqBody := embedRequest{Model: c.model, Input: texts}
+	reqBody := embedRequest{Model: c.model, Input: texts, TruncatePromptTokens: 8192}
 	if c.dims > 0 {
 		d := c.dims
 		reqBody.Dimensions = &d
