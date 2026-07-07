@@ -244,11 +244,28 @@ func completeInterruptedFinalize(cfg pipelineConfig, m Manifest) error {
 	return nil
 }
 
+// maxTextBytes plafonne le texte envoyé au slot d'embedding (max-model-len 8192 tokens :
+// 24k octets restent très en dessous même à un ratio octets/token défavorable). Mesuré sur
+// le corpus éligible complet : 17 items > 24k sur 26 691 317 (max 132 477 octets).
+const maxTextBytes = 24000
+
+// truncateUTF8 coupe s à au plus n octets sans scinder une séquence UTF-8.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && s[n]&0xC0 == 0x80 {
+		n--
+	}
+	return s[:n]
+}
+
 // produce lit le flux NDJSON et émet des lots contigus, en sautant skip items déjà traités.
 func produce(ctx context.Context, in io.Reader, batchSize int, skip int64, out chan<- batch) error {
 	sc := bufio.NewScanner(in)
-	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024) // textes HN jusqu'à ~6000 car., marge large
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024) // textes HN jusqu'à 132k octets constatés ; marge large
 	var rank int64
+	var truncated int64
 	cur := batch{startRank: skip}
 	flush := func() error {
 		if len(cur.texts) == 0 {
@@ -284,8 +301,18 @@ func produce(ctx context.Context, in io.Reader, batchSize int, skip int64, out c
 		if nl.Text == "" {
 			return fmt.Errorf("hnbook-embed: texte vide rang %d (id %d) — contrat amont violé", rank, id)
 		}
+		text := nl.Text
+		if len(text) > maxTextBytes {
+			// Plafond anti-poison : le slot d'embedding refuse (HTTP 400) au-delà de
+			// max-model-len (8192 tokens) ; sans plafond, un item monstre (17 items
+			// > 24k car. sur 26,7M, max 132 477) planterait le lot à CHAQUE reprise.
+			// La troncature respecte la frontière UTF-8. Compteur rapporté en fin de run.
+			text = truncateUTF8(text, maxTextBytes)
+			truncated++
+			slog.Warn("hnbook-embed: texte plafonné", "rank", rank, "id", id, "orig_bytes", len(nl.Text))
+		}
 		cur.ids = append(cur.ids, id)
-		cur.texts = append(cur.texts, nl.Text)
+		cur.texts = append(cur.texts, text)
 		rank++
 		if len(cur.texts) == batchSize {
 			if err := flush(); err != nil {
@@ -296,6 +323,9 @@ func produce(ctx context.Context, in io.Reader, batchSize int, skip int64, out c
 	}
 	if err := sc.Err(); err != nil {
 		return fmt.Errorf("hnbook-embed: lecture NDJSON: %w", err)
+	}
+	if truncated > 0 {
+		slog.Info("hnbook-embed: textes plafonnés sur le run", "count", truncated, "cap_bytes", maxTextBytes)
 	}
 	return flush()
 }

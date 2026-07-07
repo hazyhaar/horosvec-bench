@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hazyhaar/horosvec"
 )
@@ -258,5 +259,27 @@ func TestPipelineEmptyStreamFails(t *testing.T) {
 	cfg := baseCfg(dir, srv.URL, 8)
 	if err := runPipeline(context.Background(), cfg, strings.NewReader("")); err == nil {
 		t.Fatal("un flux vide devrait échouer (aucun vecteur produit)")
+	}
+}
+
+func TestTruncateUTF8(t *testing.T) {
+	// ASCII : coupe exacte au plafond.
+	if got := truncateUTF8("abcdef", 4); got != "abcd" {
+		t.Fatalf("ascii: %q", got)
+	}
+	// Sous le plafond : intact.
+	if got := truncateUTF8("abc", 24000); got != "abc" {
+		t.Fatalf("court: %q", got)
+	}
+	// Multi-octets : ne scinde jamais une séquence UTF-8 (é = 2 octets, coupe au milieu → recule).
+	s := "aé" // 0x61 0xC3 0xA9
+	if got := truncateUTF8(s, 2); got != "a" {
+		t.Fatalf("utf8: %q", got)
+	}
+	// Un texte monstre reste valide UTF-8 après plafonnement.
+	monster := strings.Repeat("héhé ", 30000) // 150k octets
+	out := truncateUTF8(monster, maxTextBytes)
+	if len(out) > maxTextBytes || !utf8.ValidString(out) {
+		t.Fatalf("monstre: len=%d valid=%v", len(out), utf8.ValidString(out))
 	}
 }
