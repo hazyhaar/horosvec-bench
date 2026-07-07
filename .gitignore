@@ -1,0 +1,5 @@
+bin/
+third_party/hnswgo_build/
+*.db
+*.db-wal
+*.db-shm
