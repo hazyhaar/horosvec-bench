@@ -63,7 +63,11 @@ type embedResponse struct {
 // réponse (l'ordre du tableau data n'est pas contractuel). Back-off borné sur 429, fail-loud
 // sur tout autre statut ou toute incohérence de forme.
 func (c *embedClient) embedBatch(ctx context.Context, texts []string) ([][]float32, error) {
-	reqBody := embedRequest{Model: c.model, Input: texts, TruncatePromptTokens: 8192}
+	// 8000 et non 8192 (max_model_len) : une séquence tronquée à EXACTEMENT la fenêtre
+	// du modèle déclenche une course d'ordonnanceur vLLM sous concurrence — la requête
+	// reste en Waiting sans jamais être servie (mesuré au sol 2026-07-08 : 3 pendues/24
+	// à 8192, 0/24 à 8000, mêmes lots réels, concurrence 8, direct :8005).
+	reqBody := embedRequest{Model: c.model, Input: texts, TruncatePromptTokens: 8000}
 	if c.dims > 0 {
 		d := c.dims
 		reqBody.Dimensions = &d
