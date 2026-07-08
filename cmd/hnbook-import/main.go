@@ -22,7 +22,10 @@ import (
 )
 
 // adjMeta reflète cagra_adjacency.meta.json (clés produites par le build GPU). degree est le
-// nombre de voisins par ligne d'adjacence ; n le nombre de nœuds (cross-vérifié à l'arène).
+// nombre de voisins par ligne d'adjacence ; n le nombre de nœuds (journalisé ici à titre
+// indicatif — la cohérence effective count/degree/taille est garantie en aval par les gardes
+// fail-loud de horosvec.ImportAdjacency : compte d'ids == count d'arène et taille d'adjacence
+// == count×degree×4).
 type adjMeta struct {
 	N      int64  `json:"n"`
 	Degree int    `json:"degree"`
