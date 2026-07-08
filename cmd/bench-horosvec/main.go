@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"strconv"
@@ -62,6 +64,7 @@ type horosvecEngine struct {
 	db        *sql.DB
 	tmpPath   string
 	arenaPath string // non vide quand HOROSVEC_ARENA active le mode arène fp16
+	idsPath   string // fichier d'ids uint64 LE, jumeau de l'arène (mode arène)
 }
 
 func (e *horosvecEngine) Name() string {
@@ -99,15 +102,28 @@ func (e *horosvecEngine) Build(vecs [][]float32) (float64, float64, error) {
 		return 0, 0, fmt.Errorf("open sqlite: %w", err)
 	}
 
-	// Mode arène (V2) : poser ArenaPath AVANT Build déclenche le chemin streaming
-	// vector-less — l'itérateur est consommé en flux vers l'arène fp16 au fil de l'eau,
-	// le graphe est construit depuis l'arène et SQLite est allégé (sans blob vecteur).
-	// L'arène sert ensuite le rerank de chaque balayage EfSearch (SetParam la recharge
-	// via ArenaPath). Hors mode arène : chemin par défaut strictement inchangé.
+	// Mode arène (V2) : l'entrée de V2 est une arène fp16 DÉJÀ complète (produite par
+	// hnbook-embed), pas un itérateur source. Le banc reproduit exactement ce chemin : il
+	// écrit d'abord l'arène et son fichier d'ids (uint64 LE, rang = node_id), puis construit
+	// l'index via BuildFromArena — le graphe est bâti en lisant les vecteurs à la demande
+	// depuis l'arène mmap, sans jamais matérialiser de tampon fp32 plein. La durée mesurée
+	// est celle de BuildFromArena (le build gros-index de V2), l'écriture de l'arène relevant
+	// de la phase d'embedding amont. Hors mode arène : chemin par défaut strictement inchangé.
 	cfg := e.defaultCfg()
 	if e.arenaEnabled() {
 		e.arenaPath = tmpPath + ".arena"
+		e.idsPath = tmpPath + ".ids"
 		cfg.ArenaPath = e.arenaPath
+		if err := writeArenaFile(e.arenaPath, vecs); err != nil {
+			_ = db.Close()
+			_ = os.Remove(tmpPath)
+			return 0, 0, fmt.Errorf("write arena: %w", err)
+		}
+		if err := writeIDsFile(e.idsPath, len(vecs)); err != nil {
+			_ = db.Close()
+			_ = os.Remove(tmpPath)
+			return 0, 0, fmt.Errorf("write ids: %w", err)
+		}
 	}
 
 	idx, err := horosvec.New(db, cfg)
@@ -117,9 +133,13 @@ func (e *horosvecEngine) Build(vecs [][]float32) (float64, float64, error) {
 		return 0, 0, fmt.Errorf("horosvec new: %w", err)
 	}
 
-	iter := &sliceIterator{vecs: vecs}
 	t0 := time.Now()
-	if err := idx.Build(context.Background(), iter); err != nil {
+	if e.arenaEnabled() {
+		err = idx.BuildFromArena(context.Background(), e.arenaPath, e.idsPath)
+	} else {
+		err = idx.Build(context.Background(), &sliceIterator{vecs: vecs})
+	}
+	if err != nil {
 		_ = db.Close()
 		_ = os.Remove(tmpPath)
 		return 0, 0, fmt.Errorf("horosvec build: %w", err)
@@ -132,9 +152,58 @@ func (e *horosvecEngine) Build(vecs [][]float32) (float64, float64, error) {
 	return elapsed, float64(len(vecs)) / elapsed, nil
 }
 
+// writeArenaFile écrit une arène fp16 plate (format HVARENA1) à partir des vecteurs de build,
+// via l'écrivain public d'arène. Reproduit l'artefact que hnbook-embed produit à l'échelle.
+func writeArenaFile(path string, vecs [][]float32) error {
+	if len(vecs) == 0 {
+		return fmt.Errorf("aucun vecteur")
+	}
+	w, err := horosvec.NewArenaWriter(path, len(vecs[0]))
+	if err != nil {
+		return err
+	}
+	for _, v := range vecs {
+		if err := w.WriteVec(v); err != nil {
+			w.Abort()
+			return err
+		}
+	}
+	return w.Finalize()
+}
+
+// writeIDsFile écrit le fichier d'ids jumeau de l'arène : un uint64 little-endian par rang
+// (rang = node_id). Le banc SIFT utilise le rang lui-même comme id, cohérent avec l'ext_id
+// ASCII décimal restitué par Search.
+func writeIDsFile(path string, n int) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	bw := bufio.NewWriter(f)
+	var buf [8]byte
+	for i := 0; i < n; i++ {
+		binary.LittleEndian.PutUint64(buf[:], uint64(i))
+		if _, err := bw.Write(buf[:]); err != nil {
+			_ = f.Close()
+			return err
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
 func (e *horosvecEngine) SetParam(param int) error {
 	if e.db == nil {
 		return fmt.Errorf("index non construit")
+	}
+	// Libérer la cartographie mmap de l'index courant avant d'en rouvrir une (le rechargement
+	// EfSearch reconstruit un Index frais qui remmap l'arène) — évite d'empiler les mappings.
+	if e.idx != nil {
+		_ = e.idx.Close()
+		e.idx = nil
 	}
 	cfg := e.defaultCfg()
 	cfg.EfSearch = param
@@ -167,6 +236,10 @@ func (e *horosvecEngine) Search(query []float32, k int) ([]uint64, error) {
 }
 
 func (e *horosvecEngine) Close() error {
+	if e.idx != nil {
+		_ = e.idx.Close()
+		e.idx = nil
+	}
 	if e.db != nil {
 		_ = e.db.Close()
 	}
@@ -175,6 +248,9 @@ func (e *horosvecEngine) Close() error {
 	}
 	if e.arenaPath != "" {
 		_ = os.Remove(e.arenaPath)
+	}
+	if e.idsPath != "" {
+		_ = os.Remove(e.idsPath)
 	}
 	return nil
 }
