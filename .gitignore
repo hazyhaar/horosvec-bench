@@ -4,3 +4,4 @@ third_party/hnswgo_build/
 *.db-wal
 *.db-shm
 /hnbook-embed
+hnbook-import
