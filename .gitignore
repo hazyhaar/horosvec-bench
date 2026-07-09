@@ -5,3 +5,5 @@ third_party/hnswgo_build/
 *.db-shm
 /hnbook-embed
 hnbook-import
+hnbook-build
+hnbook-validate
