@@ -233,7 +233,7 @@ func runValidation(ctx context.Context, rc runConfig) (verdict, error) {
 
 	// Conversion rang→ext_id via le fichier d'ids (décodage identique à horosvec.readArenaIDs :
 	// uint64 LE → décimal ASCII), pour comparer aux ext_id restitués par Search.
-	idsArr, err := readIDs(rc.idsPath, arenaCount)
+	ids, err := readIDs(rc.idsPath, arenaCount)
 	if err != nil {
 		return verdict{}, fmt.Errorf("ids: %w", err)
 	}
@@ -250,7 +250,7 @@ func runValidation(ctx context.Context, rc runConfig) (verdict, error) {
 	for i := range rc.queries {
 		bruteIDs := make([]string, len(bruteRanks[i]))
 		for j, rank := range bruteRanks[i] {
-			bruteIDs[j] = idsArr[rank]
+			bruteIDs[j] = ids.at(rank)
 		}
 		ov := overlap(searchIDs[i], bruteIDs, denom)
 		overlapSum += ov

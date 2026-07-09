@@ -226,10 +226,17 @@ func (h *topHeap) sortedRanks() []int64 {
 	return out
 }
 
-// readIDs lit le fichier d'ids (uint64 LE, rang = node_id) et retourne l'ext_id de chaque rang
-// en décimal ASCII — décodage identique à horosvec.readArenaIDs, pour comparer aux ext_id que
-// Search restitue. Le compte doit valoir celui de l'arène (fail-loud sinon).
-func readIDs(path string, arenaCount int64) ([]string, error) {
+// idTable est une vue sur le fichier d'ids (uint64 LE, rang = node_id) qui décode l'ext_id
+// À LA DEMANDE (décimal ASCII, identique à horosvec.readArenaIDs). Sur le run 26,7 M, seuls
+// les nq×topK rangs retenus par la force brute sont décodés : la table ne matérialise jamais
+// les 26,7 M chaînes sur le tas (elle ne garde que les octets bruts, ~8 octets par nœud).
+type idTable struct {
+	raw []byte
+	n   int64
+}
+
+// readIDs lit et valide le fichier d'ids (taille multiple de 8, compte == compte d'arène).
+func readIDs(path string, arenaCount int64) (*idTable, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -241,12 +248,13 @@ func readIDs(path string, arenaCount int64) ([]string, error) {
 	if n != arenaCount {
 		return nil, fmt.Errorf("fichier d'ids : %d ids != %d vecteurs d'arène", n, arenaCount)
 	}
-	out := make([]string, n)
-	for i := int64(0); i < n; i++ {
-		id := binary.LittleEndian.Uint64(data[i*8:])
-		out[i] = strconv.FormatUint(id, 10)
-	}
-	return out, nil
+	return &idTable{raw: data, n: n}, nil
+}
+
+// at décode l'ext_id du rang donné en décimal ASCII.
+func (t *idTable) at(rank int64) string {
+	id := binary.LittleEndian.Uint64(t.raw[rank*8:])
+	return strconv.FormatUint(id, 10)
 }
 
 // sortFloat64 trie un échantillon de latences en place (croissant).
