@@ -1,0 +1,1 @@
+{"engine":"horosvec","dataset":"base_cliff300k.fvecs","param":"512","n":300000,"dim":512,"k":10,"concurrency":1,"build_s":335.525806279,"insert_qps":894.1190048152088,"recall_mean":0.9982,"recall_min":0.6,"qps":163.51445794739064,"p50_ms":6.106999999999999,"p99_ms":8.698409999999997,"mem_mb":635.1705932617188}
