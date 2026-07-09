@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>horosvec — recherche sémantique HNbook</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --fg: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --score: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.5rem; font-weight: 600; margin: 0 0 .25rem; }
+  .lede { color: var(--muted); margin: 0 0 1.75rem; font-size: .95rem; }
+  form { display: flex; gap: .5rem; margin-bottom: 1rem; }
+  input[type=search] {
+    flex: 1; padding: .7rem .9rem; font-size: 1rem; color: var(--fg);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  }
+  input[type=search]:focus { outline: none; border-color: var(--accent); }
+  button {
+    padding: .7rem 1.1rem; font-size: 1rem; color: var(--bg); font-weight: 600;
+    background: var(--accent); border: 0; border-radius: 8px; cursor: pointer;
+  }
+  button:disabled { opacity: .55; cursor: wait; }
+  .meta { color: var(--muted); font-size: .85rem; min-height: 1.2rem; margin-bottom: 1rem; }
+  ol { list-style: none; padding: 0; margin: 0; }
+  li {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: .75rem .9rem; margin-bottom: .6rem;
+  }
+  li .title { display: block; color: var(--fg); font-size: .98rem; margin-bottom: .3rem; }
+  li a { color: var(--accent); text-decoration: none; font-size: .82rem; }
+  li a:hover { text-decoration: underline; }
+  li .score { color: var(--score); font-size: .8rem; float: right; font-variant-numeric: tabular-nums; }
+  footer { margin-top: 2.5rem; color: var(--muted); font-size: .8rem; line-height: 1.7; }
+  footer a { color: var(--accent); text-decoration: none; }
+  .banner {
+    border: 1px solid var(--border); border-radius: 8px; padding: .6rem .8rem;
+    color: var(--muted); font-size: .8rem; margin-bottom: 1.5rem; background: var(--panel);
+  }
+  .err { color: #f85149; }
+</style>
+</head>
+<body>
+<main>
+  <h1>horosvec — recherche sémantique</h1>
+  <p class="lede">Recherche vectorielle approchée sur le corpus Hacker News, servie sans GPU.</p>
+  <div class="banner">Corpus snapshot 2026-07-08 · 26,7 M items · index horosvec v0.7.0 · CPU seul</div>
+
+  <form id="f">
+    <input id="q" type="search" name="q" placeholder="Décrire un sujet, une idée, une question…"
+           maxlength="512" autocomplete="off" autofocus>
+    <button id="go" type="submit">Chercher</button>
+  </form>
+  <div class="meta" id="meta"></div>
+  <ol id="results"></ol>
+
+  <footer>
+    Démo publique du banc <a href="https://github.com/hazyhaar/horosvec-bench">horosvec-bench</a>.
+    Moteur : <a href="https://github.com/hazyhaar/horosvec">horosvec</a> (index vector-less + arène fp16).
+    Chaque résultat renvoie à sa discussion d'origine sur Hacker News.
+  </footer>
+</main>
+
+<script>
+(function () {
+  var form = document.getElementById("f");
+  var input = document.getElementById("q");
+  var btn = document.getElementById("go");
+  var meta = document.getElementById("meta");
+  var results = document.getElementById("results");
+
+  function hnLink(id) { return "https://news.ycombinator.com/item?id=" + encodeURIComponent(id); }
+
+  form.addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var q = input.value.trim();
+    if (!q) { return; }
+    btn.disabled = true;
+    meta.className = "meta";
+    meta.textContent = "Recherche en cours…";
+    results.innerHTML = "";
+
+    fetch("/api/search?q=" + encodeURIComponent(q))
+      .then(function (r) {
+        if (r.status === 429) { throw new Error("Trop de requêtes — patienter un instant."); }
+        if (r.status === 503) { throw new Error("Service d'embedding indisponible."); }
+        if (!r.ok) { throw new Error("Erreur " + r.status + "."); }
+        return r.json();
+      })
+      .then(function (data) {
+        var n = (data.results || []).length;
+        meta.textContent = n + " résultats · " + data.latency_ms.toFixed(1)
+          + " ms (dont embedding " + data.embed_ms.toFixed(1) + " ms)";
+        (data.results || []).forEach(function (it) {
+          var li = document.createElement("li");
+          var score = document.createElement("span");
+          score.className = "score";
+          score.textContent = "d² " + Number(it.score).toFixed(3);
+          li.appendChild(score);
+          var title = document.createElement("span");
+          title.className = "title";
+          // textContent : échappement natif, aucune injection possible.
+          title.textContent = it.title_snippet ? it.title_snippet : ("item " + it.id);
+          li.appendChild(title);
+          var a = document.createElement("a");
+          a.href = hnLink(it.id);
+          a.rel = "noopener noreferrer";
+          a.target = "_blank";
+          a.textContent = hnLink(it.id);
+          li.appendChild(a);
+          results.appendChild(li);
+        });
+        if (n === 0) { meta.textContent = "Aucun résultat."; }
+      })
+      .catch(function (e) {
+        meta.className = "meta err";
+        meta.textContent = e.message;
+      })
+      .finally(function () { btn.disabled = false; });
+  });
+})();
+</script>
+</body>
+</html>
