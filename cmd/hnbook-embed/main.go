@@ -13,6 +13,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -69,6 +70,13 @@ func run() error {
 	// finalize n'a pas tourné (le .tmp est repris au run suivant).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Garde G3 (fenêtre pleine interdite) : avant tout embedding, refuser fail-loud si la
+	// borne de troncature ne laisse pas de marge sous la fenêtre pleine du modèle servi.
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	if err := guardWindowMargin(ctx, *endpoint, *model, log); err != nil {
+		return err
+	}
 
 	cfg := pipelineConfig{
 		arenaPath:        *arenaPath,

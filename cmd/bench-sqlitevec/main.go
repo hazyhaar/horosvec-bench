@@ -10,6 +10,7 @@ import (
 	"github.com/hazyhaar/horosvec-bench/pkg/bench"
 	"github.com/hazyhaar/horosvec-bench/pkg/data"
 	"github.com/hazyhaar/horosvec-bench/pkg/gt"
+	"github.com/hazyhaar/horosvec-bench/pkg/storagemedium"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -51,6 +52,8 @@ func run() error {
 		K:           flags.K,
 		SweepValues: []int{0},
 		Concurrency: conc,
+		Mode:        "exact",
+		Medium:      storagemedium.Resolve(flags.Base).Medium,
 		ParamLabel: func(int) string {
 			return "exact"
 		},

@@ -24,13 +24,24 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"runtime"
 	"time"
 
 	"github.com/hazyhaar/horosvec"
+	"github.com/hazyhaar/horosvec-bench/pkg/storagemedium"
 	_ "modernc.org/sqlite"
 )
+
+// warnIfRotational émet un avertissement FORT si le chemin réside sur un support
+// rotationnel (latence ×100-370 vs SSD, campagne 2026-07). Fail-soft.
+func warnIfRotational(log *slog.Logger, role, path string) {
+	if storagemedium.Resolve(path).Medium == storagemedium.Rotational {
+		log.Warn("support de stockage rotationnel détecté : latence ×100-370 mesurée sur ce support — cf campagne 2026-07",
+			"role", role, "path", path)
+	}
+}
 
 // Seuils du verdict — constantes documentées, JAMAIS bricolables en argument de ligne de
 // commande (un banc dont on peut abaisser le seuil pour le verdir ne prouve rien).
@@ -122,6 +133,10 @@ func main() {
 
 	report := newProgress(*progressPath)
 	report.step("démarrage index=%s arena=%s queries=%s topk=%d workers=%d", *indexPath, *arenaPath, *queriesPath, *topK, *workers)
+
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	warnIfRotational(log, "arène", *arenaPath)
+	warnIfRotational(log, "index", *indexPath)
 
 	queries, err := loadQueries(*queriesPath)
 	if err != nil {

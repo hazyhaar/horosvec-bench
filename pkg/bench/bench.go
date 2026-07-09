@@ -37,6 +37,13 @@ type Options struct {
 	// Concurrency liste les niveaux de concurrence clients balayés. Vide ou nil
 	// équivaut à []int{1} (comportement séquentiel historique, inchangé).
 	Concurrency []int
+	// Mode nomme le régime de mesure émis dans chaque Result (jamais implicite).
+	// Renseigné par chaque main : "arena"/"db-blob" (horosvec), "native" (hnsw),
+	// "exact" (sqlitevec).
+	Mode string
+	// Medium nomme le support de stockage du chemin de données, résolu par le main
+	// via pkg/storagemedium (fail-soft ; "unknown" toléré).
+	Medium string
 }
 
 // RunWithBuild exécute build + protocole de mesure.
@@ -97,6 +104,8 @@ func runMeasured(eng Engine, queries [][]float32, ground gt.GroundTruth, n, dim 
 				Engine:      eng.Name(),
 				Dataset:     opt.DatasetName,
 				Param:       paramStr,
+				Mode:        opt.Mode,
+				Medium:      opt.Medium,
 				N:           n,
 				Dim:         dim,
 				K:           opt.K,

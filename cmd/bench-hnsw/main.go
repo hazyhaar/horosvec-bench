@@ -10,6 +10,7 @@ import (
 	"github.com/hazyhaar/horosvec-bench/pkg/bench"
 	"github.com/hazyhaar/horosvec-bench/pkg/data"
 	"github.com/hazyhaar/horosvec-bench/pkg/gt"
+	"github.com/hazyhaar/horosvec-bench/pkg/storagemedium"
 )
 
 const (
@@ -59,6 +60,8 @@ func run() error {
 		K:           flags.K,
 		SweepValues: sweep,
 		Concurrency: conc,
+		Mode:        "native",
+		Medium:      storagemedium.Resolve(flags.Base).Medium,
 		ParamLabel: func(v int) string {
 			return strconv.Itoa(v)
 		},

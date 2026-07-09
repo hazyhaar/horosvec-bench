@@ -23,11 +23,21 @@ import (
 	"time"
 
 	"github.com/hazyhaar/horosvec"
+	"github.com/hazyhaar/horosvec-bench/pkg/storagemedium"
 	_ "modernc.org/sqlite"
 )
 
 //go:embed index.html
 var indexHTML []byte
+
+// warnIfRotational émet un avertissement FORT si le chemin réside sur un support
+// rotationnel (latence ×100-370 vs SSD, campagne 2026-07). Fail-soft.
+func warnIfRotational(log *slog.Logger, role, path string) {
+	if storagemedium.Resolve(path).Medium == storagemedium.Rotational {
+		log.Warn("support de stockage rotationnel détecté : latence ×100-370 mesurée sur ce support — cf campagne 2026-07",
+			"role", role, "path", path)
+	}
+}
 
 func main() {
 	indexPath := flag.String("index", "", "index SQLite vector-less (adossé à l'arène, lecture seule)")
@@ -54,6 +64,9 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	warnIfRotational(log, "arène", *arenaPath)
+	warnIfRotational(log, "index", *indexPath)
 
 	idx, dbCloser, err := openIndex(*indexPath, *arenaPath)
 	if err != nil {

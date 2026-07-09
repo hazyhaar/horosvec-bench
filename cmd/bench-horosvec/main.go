@@ -5,7 +5,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"time"
@@ -14,8 +16,19 @@ import (
 	"github.com/hazyhaar/horosvec-bench/pkg/bench"
 	"github.com/hazyhaar/horosvec-bench/pkg/data"
 	"github.com/hazyhaar/horosvec-bench/pkg/gt"
+	"github.com/hazyhaar/horosvec-bench/pkg/storagemedium"
 
 	_ "modernc.org/sqlite"
+)
+
+// Modes de mesure de horosvec. "db-blob" (défaut) : rerank par chargement SQL ligne à
+// ligne du blob fp32. "arena" : rerank fp16 servi par l'arène mmap. Le mode n'est JAMAIS
+// implicite — il est journalisé au démarrage et gravé dans chaque ligne du JSONL, après
+// l'incident 2026-07 (opt-in arène silencieux via HOROSVEC_ARENA, deux jours de mesures
+// non attribuables).
+const (
+	modeDBBlob = "db-blob"
+	modeArena  = "arena"
 )
 
 func main() {
@@ -26,8 +39,18 @@ func main() {
 }
 
 func run() error {
+	// Le flag -mode s'enregistre sur le CommandLine par défaut AVANT bench.ParseFlags,
+	// qui appelle flag.Parse() : les deux jeux de flags sont parsés ensemble.
+	modeFlag := flag.String("mode", modeDBBlob, "régime de mesure : arena (rerank fp16 via arène) | db-blob (rerank SQL, défaut)")
 	flags := bench.ParseFlags()
 	if err := flags.Validate(); err != nil {
+		return err
+	}
+
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+
+	mode, err := resolveMode(*modeFlag, log)
+	if err != nil {
 		return err
 	}
 
@@ -51,7 +74,7 @@ func run() error {
 		return err
 	}
 
-	eng := &horosvecEngine{}
+	eng := &horosvecEngine{mode: mode}
 	defer eng.Close()
 
 	return bench.RunWithBuild(eng, ds.Base, ds.Queries, ground, bench.Options{
@@ -59,30 +82,73 @@ func run() error {
 		K:           flags.K,
 		SweepValues: sweep,
 		Concurrency: conc,
+		Mode:        mode,
+		// L'arène et la base temporaire résident sous os.TempDir : c'est ce support
+		// (et non le fichier -base lu une seule fois) qui gouverne la latence mesurée.
+		Medium: storagemedium.Resolve(os.TempDir()).Medium,
 		ParamLabel: func(v int) string {
 			return strconv.Itoa(v)
 		},
 	})
 }
 
+// resolveMode arbitre le mode effectif entre le flag -mode, son défaut, et l'ancien
+// opt-in par variable d'environnement HOROSVEC_ARENA (honoré mais déprécié, avec
+// avertissement). Le mode retenu est journalisé en clair au démarrage (première ligne
+// slog), jamais laissé silencieux.
+func resolveMode(flagVal string, log *slog.Logger) (string, error) {
+	if flagVal != modeArena && flagVal != modeDBBlob {
+		return "", fmt.Errorf("mode inconnu %q (attendu %s|%s)", flagVal, modeArena, modeDBBlob)
+	}
+	explicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "mode" {
+			explicit = true
+		}
+	})
+
+	mode := flagVal
+	source := "flag"
+	if !explicit {
+		source = "défaut"
+	}
+
+	if os.Getenv("HOROSVEC_ARENA") != "" {
+		log.Warn("HOROSVEC_ARENA est déprécié : préférer -mode arena")
+		if !explicit {
+			mode = modeArena
+			source = "env HOROSVEC_ARENA (déprécié)"
+		} else if mode != modeArena {
+			log.Warn("conflit -mode/HOROSVEC_ARENA : l'environnement est honoré",
+				"mode_flag", mode, "mode_effectif", modeArena)
+			mode = modeArena
+			source = "env HOROSVEC_ARENA (déprécié, surclasse -mode)"
+		}
+	}
+
+	log.Info("bench-horosvec démarrage", "mode", mode, "source", source)
+	return mode, nil
+}
+
 type horosvecEngine struct {
+	mode      string // modeArena | modeDBBlob (résolu par resolveMode)
 	idx       *horosvec.Index
 	db        *sql.DB
 	tmpPath   string
-	arenaPath string // non vide quand HOROSVEC_ARENA active le mode arène fp16
+	arenaPath string // non vide quand le mode arène fp16 est actif
 	idsPath   string // fichier d'ids uint64 LE, jumeau de l'arène (mode arène)
 }
 
 func (e *horosvecEngine) Name() string {
-	if os.Getenv("HOROSVEC_ARENA") != "" {
+	if e.mode == modeArena {
 		return "horosvec-arena"
 	}
 	return "horosvec"
 }
 
-// arenaEnabled indique si le rerank doit lire l'arène fp16 (opt-in via HOROSVEC_ARENA).
+// arenaEnabled indique si le rerank doit lire l'arène fp16 (mode arène explicite).
 func (e *horosvecEngine) arenaEnabled() bool {
-	return os.Getenv("HOROSVEC_ARENA") != ""
+	return e.mode == modeArena
 }
 
 func (e *horosvecEngine) defaultCfg() horosvec.Config {

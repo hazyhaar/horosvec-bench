@@ -14,12 +14,24 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
 	"github.com/hazyhaar/horosvec"
+	"github.com/hazyhaar/horosvec-bench/pkg/storagemedium"
 	_ "modernc.org/sqlite"
 )
+
+// warnIfRotational émet un avertissement FORT si le chemin donné réside sur un support
+// rotationnel : la latence d'accès à l'arène/l'index y dépasse le SSD d'un facteur 100 à
+// 370 (campagne 2026-07). Fail-soft : "unknown" ou "ssd" ne dit rien.
+func warnIfRotational(log *slog.Logger, role, path string) {
+	if storagemedium.Resolve(path).Medium == storagemedium.Rotational {
+		log.Warn("support de stockage rotationnel détecté : latence ×100-370 mesurée sur ce support — cf campagne 2026-07",
+			"role", role, "path", path)
+	}
+}
 
 // adjMeta reflète cagra_adjacency.meta.json (clés produites par le build GPU). degree est le
 // nombre de voisins par ligne d'adjacence ; n le nombre de nœuds (journalisé ici à titre
@@ -54,6 +66,10 @@ func main() {
 
 	report := newProgress(*progressPath)
 	report.step("démarrage arena=%s ids=%s adjacency=%s out=%s", *arenaPath, *idsPath, *adjPath, *outPath)
+
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	warnIfRotational(log, "arène", *arenaPath)
+	warnIfRotational(log, "index", *outPath)
 
 	degree := *degreeFlag
 	if meta, err := readMeta(*metaPath); err == nil {
