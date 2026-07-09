@@ -37,6 +37,11 @@ func run() error {
 		return err
 	}
 
+	conc, err := bench.ParseConcurrency(flags.Concurrency)
+	if err != nil {
+		return err
+	}
+
 	eng := &sqlitevecEngine{}
 	defer eng.Close()
 
@@ -45,6 +50,7 @@ func run() error {
 		DatasetName: ds.Name,
 		K:           flags.K,
 		SweepValues: []int{0},
+		Concurrency: conc,
 		ParamLabel: func(int) string {
 			return "exact"
 		},

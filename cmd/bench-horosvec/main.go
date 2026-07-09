@@ -46,6 +46,11 @@ func run() error {
 		return err
 	}
 
+	conc, err := bench.ParseConcurrency(flags.Concurrency)
+	if err != nil {
+		return err
+	}
+
 	eng := &horosvecEngine{}
 	defer eng.Close()
 
@@ -53,6 +58,7 @@ func run() error {
 		DatasetName: ds.Name,
 		K:           flags.K,
 		SweepValues: sweep,
+		Concurrency: conc,
 		ParamLabel: func(v int) string {
 			return strconv.Itoa(v)
 		},

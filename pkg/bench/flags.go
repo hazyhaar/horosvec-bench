@@ -7,13 +7,14 @@ import (
 
 // CommonFlags regroupe les flags partagés par les trois binaires.
 type CommonFlags struct {
-	Base    string
-	Queries string
-	GT      string
-	K       int
-	Limit   int
-	Sweep   string
-	Holdout int
+	Base        string
+	Queries     string
+	GT          string
+	K           int
+	Limit       int
+	Sweep       string
+	Holdout     int
+	Concurrency string
 }
 
 // ParseFlags lit les flags CLI communs.
@@ -26,6 +27,7 @@ func ParseFlags() CommonFlags {
 	flag.IntVar(&f.Limit, "limit", 0, "tronquer la base aux N premiers vecteurs (0=tout)")
 	flag.StringVar(&f.Sweep, "sweep", "64,128,256,512", "valeurs balayées (EfSearch/ef)")
 	flag.IntVar(&f.Holdout, "holdout", 0, "si -queries==-base, retirer les N derniers vecteurs comme requêtes")
+	flag.StringVar(&f.Concurrency, "concurrency", "1", "niveaux de concurrence clients balayés (ex. 1,8,32 ; 1=séquentiel)")
 	flag.Parse()
 	return f
 }
