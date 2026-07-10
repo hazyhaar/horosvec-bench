@@ -195,10 +195,18 @@
 
     var links = document.createElement("div");
     links.className = "links";
+    // On ne pose l'href tiers que pour un schéma http(s) — bloque javascript:/data:.
+    var safeUrl = "";
     if (item && item.url) {
+      try {
+        var pu = new URL(item.url);
+        if (pu.protocol === "http:" || pu.protocol === "https:") { safeUrl = pu.href; }
+      } catch (e) { safeUrl = ""; }
+    }
+    if (safeUrl) {
       var au = document.createElement("a");
-      au.href = item.url; au.rel = "noopener noreferrer nofollow"; au.target = "_blank";
-      au.textContent = "Lien cible (" + (urlHost(item.url) || "url") + ")";
+      au.href = safeUrl; au.rel = "noopener noreferrer nofollow"; au.target = "_blank";
+      au.textContent = "Lien cible (" + (urlHost(safeUrl) || "url") + ")";
       links.appendChild(au);
     }
     var ah = document.createElement("a");
