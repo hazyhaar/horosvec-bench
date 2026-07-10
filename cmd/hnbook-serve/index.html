@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>horosvec — recherche sémantique HNbook</title>
+<title>horosvec — semantic search over Hacker News</title>
 <style>
   :root {
     --bg: #0d1117; --panel: #161b22; --panel-hi: #1c2330; --border: #30363d;
@@ -119,14 +119,14 @@
 </head>
 <body>
 <main>
-  <h1>horosvec — recherche sémantique</h1>
-  <p class="lede">Recherche vectorielle approchée sur le corpus Hacker News, servie sans GPU.</p>
-  <div class="banner">Corpus snapshot 2026-07-08 · 26,7 M items · index horosvec v0.7.0 · CPU seul</div>
+  <h1>horosvec — semantic search</h1>
+  <p class="lede">Approximate vector search over the Hacker News corpus, served without a GPU.</p>
+  <div class="banner">Hacker News corpus · 2006 → October 2021 · 26.7M items · horosvec v0.7.0 index · CPU-only</div>
 
   <form id="f">
-    <input id="q" type="search" name="q" placeholder="Décrire un sujet, une idée, une question…"
+    <input id="q" type="search" name="q" placeholder="Describe a topic, an idea, a question…"
            maxlength="512" autocomplete="off" autofocus>
-    <button id="go" type="submit">Chercher</button>
+    <button id="go" type="submit">Search</button>
   </form>
   <div class="meta" id="meta"></div>
 
@@ -134,31 +134,31 @@
     <div class="col-left">
       <div class="listbar" id="listbar" hidden>
         <div>
-          <label for="sort">Trier :</label>
+          <label for="sort">Sort:</label>
           <select id="sort">
-            <option value="relevance">Pertinence</option>
-            <option value="recent">Plus récent</option>
-            <option value="oldest">Plus ancien</option>
+            <option value="relevance">Relevance</option>
+            <option value="recent">Newest</option>
+            <option value="oldest">Oldest</option>
           </select>
         </div>
         <div class="sort-note" id="sortNote"></div>
       </div>
       <ol id="results"></ol>
       <div class="pager" id="pager" hidden>
-        <button id="prev" type="button">‹ Précédent</button>
+        <button id="prev" type="button">‹ Previous</button>
         <span class="page-ind" id="pageInd"></span>
-        <button id="next" type="button">Suivant ›</button>
+        <button id="next" type="button">Next ›</button>
       </div>
     </div>
     <div class="col-right" id="detail">
-      <p class="detail-empty">Sélectionner un résultat pour l'afficher.</p>
+      <p class="detail-empty">Select a result to view it.</p>
     </div>
   </div>
 
   <footer>
-    Démo publique du banc <a href="https://github.com/hazyhaar/horosvec-bench">horosvec-bench</a>.
-    Moteur : <a href="https://github.com/hazyhaar/horosvec">horosvec</a> (index vector-less + arène fp16).
-    Contenu des items enrichi à la volée via l'API publique Hacker News.
+    Public demo of the <a href="https://github.com/hazyhaar/horosvec-bench">horosvec-bench</a> benchmark.
+    Engine: <a href="https://github.com/hazyhaar/horosvec">horosvec</a> (vector-less index + fp16 arena).
+    Item content is enriched on the fly via the public Hacker News API.
   </footer>
 </main>
 
@@ -249,14 +249,13 @@
     return (item && typeof item.time === "number") ? item.time : null;
   }
 
-  // dateOf rend une date courte lisible (JJ/MM/AAAA) depuis l'epoch de l'item, ou "" si absente.
+  // dateOf renders a short readable date ("3 Oct 2021") from the item epoch, or "" if absent.
+  var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   function dateOf(item) {
     var t = itemTime(item);
     if (t === null) { return ""; }
     var d = new Date(t * 1000);
-    var dd = String(d.getDate()).padStart(2, "0");
-    var mm = String(d.getMonth() + 1).padStart(2, "0");
-    return dd + "/" + mm + "/" + d.getFullYear();
+    return d.getDate() + " " + MONTHS[d.getMonth()] + " " + d.getFullYear();
   }
 
   // prefetchItems précharge les items d'une liste d'ids en concurrence BORNÉE (pool de POOL en
@@ -372,12 +371,12 @@
     sub.className = "sub";
     if (item) {
       var parts = [];
-      if (item.by) { parts.push("par " + item.by); }
-      if (item.time) { parts.push(new Date(item.time * 1000).toLocaleString("fr-FR")); }
+      if (item.by) { parts.push("by " + item.by); }
+      if (item.time) { parts.push(new Date(item.time * 1000).toLocaleString("en-US")); }
       if (typeof item.score === "number") { parts.push(item.score + " points"); }
       sub.textContent = parts.join(" · ");
     } else {
-      sub.textContent = "Item introuvable ou supprimé (id " + id + ").";
+      sub.textContent = "Item not found or deleted (id " + id + ").";
     }
     wrap.appendChild(sub);
 
@@ -387,7 +386,7 @@
     if (extUrl) {
       var og = document.createElement("div");
       og.className = "og loading";
-      og.textContent = "Chargement de l'aperçu…";
+      og.textContent = "Loading preview…";
       wrap.appendChild(og);
       loadPreview(og, extUrl);
     }
@@ -413,12 +412,12 @@
     if (safeUrl) {
       var au = document.createElement("a");
       au.href = safeUrl; au.rel = "noopener noreferrer nofollow"; au.target = "_blank";
-      au.textContent = "Lien cible (" + (urlHost(safeUrl) || "url") + ")";
+      au.textContent = "Target link (" + (urlHost(safeUrl) || "url") + ")";
       links.appendChild(au);
     }
     var ah = document.createElement("a");
     ah.href = hnLink(id); ah.rel = "noopener noreferrer"; ah.target = "_blank";
-    ah.textContent = "Discussion Hacker News";
+    ah.textContent = "Hacker News discussion";
     links.appendChild(ah);
     wrap.appendChild(links);
 
@@ -429,7 +428,7 @@
     var prev = results.querySelector("li.card.active");
     if (prev) { prev.classList.remove("active"); }
     li.classList.add("active");
-    detail.innerHTML = "<p class=\"detail-empty\">Chargement…</p>";
+    detail.innerHTML = "<p class=\"detail-empty\">Loading…</p>";
     fetchItem(id).then(function (item) {
       // Ne rendre que si la carte est toujours celle sélectionnée.
       if (li.classList.contains("active")) { renderDetail(item, id); }
@@ -506,8 +505,8 @@
     var slice = ordered.slice(start, start + PAGE_SIZE);
     slice.forEach(function (res) { buildCard(res); });
 
-    pageInd.textContent = "Page " + (currentPage + 1) + " / " + pages
-      + " · " + total + " résultats";
+    pageInd.textContent = "Page " + (currentPage + 1) + " of " + pages
+      + " · " + total + " results";
     prevBtn.disabled = currentPage === 0;
     nextBtn.disabled = currentPage >= pages - 1;
     pager.hidden = total <= PAGE_SIZE;
@@ -531,32 +530,32 @@
     if (!q) { return; }
     btn.disabled = true;
     meta.className = "meta";
-    meta.textContent = "Recherche en cours…";
+    meta.textContent = "Searching…";
     results.innerHTML = "";
     listbar.hidden = true;
     pager.hidden = true;
     allResults = [];
     currentPage = 0;
-    detail.innerHTML = "<p class=\"detail-empty\">Sélectionner un résultat pour l'afficher.</p>";
+    detail.innerHTML = "<p class=\"detail-empty\">Select a result to view it.</p>";
 
     fetch("/api/search?q=" + encodeURIComponent(q) + "&k=" + REQUEST_K)
       .then(function (r) {
-        if (r.status === 429) { throw new Error("Trop de requêtes — patienter un instant."); }
-        if (r.status === 503) { throw new Error("Service d'embedding indisponible."); }
-        if (!r.ok) { throw new Error("Erreur " + r.status + "."); }
+        if (r.status === 429) { throw new Error("Too many requests — please wait a moment."); }
+        if (r.status === 503) { throw new Error("Embedding service unavailable."); }
+        if (!r.ok) { throw new Error("Error " + r.status + "."); }
         return r.json();
       })
       .then(function (data) {
         var list = data.results || [];
         var n = list.length;
-        meta.textContent = n + " résultats · " + data.latency_ms.toFixed(1)
-          + " ms (dont embedding " + data.embed_ms.toFixed(1) + " ms)";
-        if (n === 0) { meta.textContent = "Aucun résultat."; return; }
+        meta.textContent = n + " results · " + data.latency_ms.toFixed(1)
+          + " ms (embedding " + data.embed_ms.toFixed(1) + " ms)";
+        if (n === 0) { meta.textContent = "No results."; return; }
 
         allResults = list.map(function (res) { return { id: res.id, score: res.score }; });
-        // Libellé honnête : le tri porte sur les N résultats pertinents retrouvés, jamais sur
-        // le corpus global de 26,7 M items.
-        sortNote.textContent = "Tri des " + n + " résultats pertinents retrouvés (pas du corpus global).";
+        // Honest label: sorting applies to the N relevant results retrieved, never to the
+        // whole corpus of 26.7M items.
+        sortNote.textContent = "Sorting the " + n + " relevant results retrieved (not the whole corpus).";
         listbar.hidden = false;
         currentSort = "relevance";
         sortSel.value = "relevance";

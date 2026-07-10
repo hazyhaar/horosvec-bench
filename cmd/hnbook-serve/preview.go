@@ -185,11 +185,11 @@ func (p *previewer) fetch(ctx context.Context, raw string) previewResult {
 
 	u, err := url.Parse(raw)
 	if err != nil {
-		res.Error = "url invalide"
+		res.Error = "invalid url"
 		return res
 	}
 	if err := validatePreviewURL(u); err != nil {
-		res.Error = "cible refusée"
+		res.Error = "target refused"
 		return res
 	}
 
@@ -198,7 +198,7 @@ func (p *previewer) fetch(ctx context.Context, raw string) previewResult {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		res.Error = "requête invalide"
+		res.Error = "invalid request"
 		return res
 	}
 	req.Header.Set("User-Agent", previewUserAgent)
@@ -206,23 +206,23 @@ func (p *previewer) fetch(ctx context.Context, raw string) previewResult {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		res.Error = "cible injoignable"
+		res.Error = "target unreachable"
 		return res
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		res.Error = fmt.Sprintf("statut %d", resp.StatusCode)
+		res.Error = fmt.Sprintf("status %d", resp.StatusCode)
 		return res
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "text/html") {
-		res.Error = "contenu non-HTML"
+		res.Error = "non-HTML content"
 		return res
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, previewMaxBody))
 	if err != nil {
-		res.Error = "lecture interrompue"
+		res.Error = "read interrupted"
 		return res
 	}
 

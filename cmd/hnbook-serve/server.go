@@ -159,9 +159,9 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if e := s.loadErr.Load(); e != nil {
 		w.Header().Set("Retry-After", "5")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("<!doctype html><meta charset=utf-8><title>horosvec — indisponible</title>" +
+		_, _ = w.Write([]byte("<!doctype html><meta charset=utf-8><title>horosvec — unavailable</title>" +
 			"<body style=\"background:#0d1117;color:#e6edf3;font-family:sans-serif;text-align:center;padding:4rem 1rem\">" +
-			"<h1>Service momentanément indisponible</h1><p style=\"color:#8b949e\">Le chargement de l'index a échoué.</p></body>"))
+			"<h1>Service temporarily unavailable</h1><p style=\"color:#8b949e\">Loading the index failed.</p></body>"))
 		return
 	}
 	w.Header().Set("Retry-After", "5")
@@ -181,10 +181,10 @@ func (s *server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Retry-After", "5")
 	w.WriteHeader(http.StatusServiceUnavailable)
 	if e := s.loadErr.Load(); e != nil {
-		_, _ = w.Write([]byte("erreur: " + *e + "\n"))
+		_, _ = w.Write([]byte("error: " + *e + "\n"))
 		return
 	}
-	_, _ = w.Write([]byte("préchauffage\n"))
+	_, _ = w.Write([]byte("warming\n"))
 }
 
 // warmingGate rend true (et a écrit la réponse) si l'index n'est pas encore prêt : les routes
@@ -213,17 +213,17 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	ip := clientIP(r, s.trustProxy)
 	if !s.lim.allow(ip) {
-		s.writeError(w, http.StatusTooManyRequests, "trop de requêtes")
+		s.writeError(w, http.StatusTooManyRequests, "too many requests")
 		return
 	}
 
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	if q == "" {
-		s.writeError(w, http.StatusBadRequest, "paramètre q manquant")
+		s.writeError(w, http.StatusBadRequest, "missing q parameter")
 		return
 	}
 	if len(q) > maxQueryBytes {
-		s.writeError(w, http.StatusBadRequest, "requête trop longue")
+		s.writeError(w, http.StatusBadRequest, "query too long")
 		return
 	}
 
@@ -234,8 +234,8 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	vec, err := s.embed.embed(ctx, q)
 	embedMS := float64(time.Since(tEmbed).Microseconds()) / 1000.0
 	if err != nil {
-		s.log.Error("embedding indisponible", "ip", ip, "err", err.Error())
-		s.writeError(w, http.StatusServiceUnavailable, "service d'embedding indisponible")
+		s.log.Error("embedding unavailable", "ip", ip, "err", err.Error())
+		s.writeError(w, http.StatusServiceUnavailable, "embedding service unavailable")
 		return
 	}
 
@@ -252,8 +252,8 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	tSearch := time.Now()
 	res, err := idx.Search(ctx, vec, topK)
 	if err != nil {
-		s.log.Error("recherche échouée", "ip", ip, "err", err.Error())
-		s.writeError(w, http.StatusInternalServerError, "recherche indisponible")
+		s.log.Error("search failed", "ip", ip, "err", err.Error())
+		s.writeError(w, http.StatusInternalServerError, "search unavailable")
 		return
 	}
 	totalMS := embedMS + float64(time.Since(tSearch).Microseconds())/1000.0
@@ -274,7 +274,7 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		out.Results = append(out.Results, sr)
 	}
 
-	s.log.Info("recherche", "ip", ip, "q_len", len(q), "results", len(out.Results),
+	s.log.Info("search", "ip", ip, "q_len", len(q), "results", len(out.Results),
 		"latency_ms", totalMS, "embed_ms", embedMS)
 	s.writeJSON(w, http.StatusOK, out)
 }
@@ -290,17 +290,17 @@ func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 	ip := clientIP(r, s.trustProxy)
 	if !s.lim.allow(ip) {
-		s.writeError(w, http.StatusTooManyRequests, "trop de requêtes")
+		s.writeError(w, http.StatusTooManyRequests, "too many requests")
 		return
 	}
 
 	raw := strings.TrimSpace(r.URL.Query().Get("url"))
 	if raw == "" {
-		s.writeJSON(w, http.StatusOK, previewResult{Error: "paramètre url manquant"})
+		s.writeJSON(w, http.StatusOK, previewResult{Error: "missing url parameter"})
 		return
 	}
 	if len(raw) > maxPreviewURLParamLen {
-		s.writeJSON(w, http.StatusOK, previewResult{URL: raw[:64], Error: "url trop longue"})
+		s.writeJSON(w, http.StatusOK, previewResult{URL: raw[:64], Error: "url too long"})
 		return
 	}
 
@@ -314,7 +314,7 @@ func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	p.store(raw, res)
 
 	if res.Error != "" {
-		s.log.Info("prévisualisation dégradée", "ip", ip, "err", res.Error)
+		s.log.Info("degraded preview", "ip", ip, "err", res.Error)
 	}
 	s.writeJSON(w, http.StatusOK, res)
 }
