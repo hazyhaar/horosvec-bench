@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,6 +30,14 @@ import (
 
 //go:embed index.html
 var indexHTML []byte
+
+//go:embed warming.html
+var warmingHTML []byte
+
+// loadErrorGrace est le délai laissé après un échec de chargement de l'index avant que le
+// process ne sorte en erreur : le temps qu'un visiteur voie la page d'indisponibilité et que la
+// supervision lise un /healthz en 503, sans jamais rester en préchauffage éternel silencieux.
+const loadErrorGrace = 30 * time.Second
 
 // warnIfRotational émet un avertissement FORT si le chemin réside sur un support
 // rotationnel (latence ×100-370 vs SSD, campagne 2026-07). Fail-soft.
@@ -68,14 +77,8 @@ func main() {
 	warnIfRotational(log, "arène", *arenaPath)
 	warnIfRotational(log, "index", *indexPath)
 
-	idx, dbCloser, err := openIndex(*indexPath, *arenaPath)
-	if err != nil {
-		log.Error("ouverture index", "err", err.Error())
-		os.Exit(1)
-	}
-	defer idx.Close()
-	defer dbCloser()
-
+	// Les titres sont un simple chargement de fichier (rapide) et n'entrent pas dans la fenêtre
+	// coûteuse de ~90 s : ils restent synchrones, avant la liaison du port.
 	titles, err := loadTitles(*titlesPath)
 	if err != nil {
 		log.Error("chargement titres", "path", *titlesPath, "err", err.Error())
@@ -88,25 +91,59 @@ func main() {
 	}
 
 	srv := &server{
-		idx:        idx,
 		embed:      &embedClient{url: *embedURL, hc: &http.Client{Timeout: 10 * time.Second}},
 		titles:     titles,
 		lim:        newIPLimiter(ctx, 1.0, 5.0),
 		reqTimeout: 10 * time.Second,
 		topK:       *topK,
 		html:       indexHTML,
+		warming:    warmingHTML,
 		log:        log,
 		trustProxy: *trustProxy,
 	}
 
+	// Le port est lié IMMÉDIATEMENT, avant tout chargement d'index : dès cet instant le proxy
+	// amont obtient une réponse (page de préchauffage) au lieu d'un 502 pendant ~90 s.
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Error("liaison du port", "addr", *addr, "err", err.Error())
+		os.Exit(1)
+	}
+
 	httpSrv := &http.Server{
-		Addr:              *addr,
 		Handler:           http.MaxBytesHandler(srv.routes(), 4096),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      20 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+
+	// Chargement de l'index en tâche de fond : le service sert déjà la page de préchauffage
+	// pendant ce temps. Succès -> publication atomique de l'index (bascule à « prêt »). Échec ->
+	// état d'erreur fail-loud, puis sortie non-zéro après un délai de grâce (jamais de
+	// préchauffage éternel silencieux).
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				log.Error("panique dans la goroutine de chargement de l'index", "panic", p)
+				msg := "erreur interne au chargement de l'index"
+				srv.loadErr.Store(&msg)
+			}
+		}()
+		idx, dbCloser, err := openIndex(*indexPath, *arenaPath)
+		if err != nil {
+			log.Error("chargement de l'index échoué (fail-loud)", "err", err.Error())
+			msg := "chargement de l'index impossible"
+			srv.loadErr.Store(&msg)
+			time.Sleep(loadErrorGrace)
+			log.Error("arrêt du process après échec de chargement de l'index", "grace", loadErrorGrace.String())
+			os.Exit(1)
+		}
+		closeIdx := func() { _ = idx.Close(); dbCloser() }
+		srv.onClose.Store(&closeIdx)
+		srv.setIndex(idx)
+		log.Info("index chargé, recherche disponible", "index", *indexPath, "arena", *arenaPath)
+	}()
 
 	go func() {
 		defer func() {
@@ -120,11 +157,14 @@ func main() {
 		_ = httpSrv.Shutdown(shutCtx)
 	}()
 
-	log.Info("hnbook-serve à l'écoute", "addr", *addr, "index", *indexPath, "arena", *arenaPath,
-		"embed_url", *embedURL, "topk", *topK)
-	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	log.Info("hnbook-serve à l'écoute (préchauffage de l'index en cours)", "addr", *addr,
+		"index", *indexPath, "arena", *arenaPath, "embed_url", *embedURL, "topk", *topK)
+	if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		log.Error("serveur HTTP", "err", err.Error())
 		os.Exit(1)
+	}
+	if c := srv.onClose.Load(); c != nil {
+		(*c)()
 	}
 	log.Info("hnbook-serve arrêté proprement")
 }

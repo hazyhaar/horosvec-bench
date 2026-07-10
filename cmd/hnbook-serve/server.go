@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hazyhaar/horosvec"
@@ -32,7 +33,19 @@ type searcher interface {
 // table de titres optionnelle, limiteur de débit, page embarquée). Aucun état mutable de
 // requête n'y est conservé : le service est sans état, seul le limiteur mute (sous son mutex).
 type server struct {
-	idx        searcher
+	// idxHolder porte l'index de recherche publié atomiquement une fois le chargement terminé.
+	// Il est nil pendant le préchauffage (démarrage : le port est lié tout de suite, l'index se
+	// charge en tâche de fond). Les gestionnaires le lisent via index() sans course : l'index
+	// n'est jamais accédé avant d'être prêt (aucun déréférencement de nil pendant le chargement).
+	idxHolder atomic.Pointer[searcher]
+	// loadErr porte un message d'erreur bref si le chargement de l'index a échoué (fail-loud). Non
+	// nil => les routes rendent 503 avec ce message plutôt qu'une page de préchauffage éternelle.
+	loadErr atomic.Pointer[string]
+	// onClose porte la fermeture de l'index (arène + base sous-jacente), publiée atomiquement par
+	// la goroutine de chargement et lue par le point d'assemblage à l'arrêt, sans course.
+	onClose atomic.Pointer[func()]
+	// warming est la page servie sur GET / tant que l'index n'est pas prêt (auto-rafraîchie).
+	warming    []byte
 	embed      *embedClient
 	titles     map[string]string
 	lim        *ipLimiter
@@ -50,6 +63,22 @@ type server struct {
 	// évite tout câblage supplémentaire au point d'assemblage du serveur.
 	prev     *previewer
 	prevOnce sync.Once
+}
+
+// setIndex publie l'index chargé : à partir de cet instant, les gestionnaires de recherche le
+// voient prêt (bascule atomique du drapeau de disponibilité).
+func (s *server) setIndex(idx searcher) {
+	s.idxHolder.Store(&idx)
+}
+
+// index restitue l'index si le préchauffage est terminé, sinon (nil, false). Lecture atomique,
+// sans course avec la goroutine de chargement.
+func (s *server) index() (searcher, bool) {
+	p := s.idxHolder.Load()
+	if p == nil {
+		return nil, false
+	}
+	return *p, true
 }
 
 // previewer restitue le mandataire de prévisualisation, construit une seule fois. Un previewer
@@ -87,7 +116,10 @@ func (s *server) routes() *http.ServeMux {
 	return mux
 }
 
-// handleIndex sert la page de recherche embarquée.
+// handleIndex sert la page de recherche embarquée une fois l'index prêt. Pendant le
+// préchauffage, il rend la page « préchauffage en cours » auto-rafraîchie (HTTP 200 : la page
+// est statique, sans donnée distante). En cas d'échec de chargement, il rend un message bref en
+// 503 plutôt qu'une promesse de disponibilité imminente.
 func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -95,13 +127,55 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	_, _ = w.Write(s.html)
+	if _, ok := s.index(); ok {
+		_, _ = w.Write(s.html)
+		return
+	}
+	if e := s.loadErr.Load(); e != nil {
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("<!doctype html><meta charset=utf-8><title>horosvec — indisponible</title>" +
+			"<body style=\"background:#0d1117;color:#e6edf3;font-family:sans-serif;text-align:center;padding:4rem 1rem\">" +
+			"<h1>Service momentanément indisponible</h1><p style=\"color:#8b949e\">Le chargement de l'index a échoué.</p></body>"))
+		return
+	}
+	w.Header().Set("Retry-After", "5")
+	_, _ = w.Write(s.warming)
 }
 
-// handleHealthz est la sonde de vivacité du serveur (n'engage pas le sidecar).
+// handleHealthz est ici une sonde de DISPONIBILITÉ (readiness), pas de simple vivacité : elle
+// rend 200 uniquement lorsque l'index est chargé et que la recherche est réellement servie, 503
+// tant que le préchauffage dure (ou en cas d'échec de chargement). C'est le signal honnête que
+// lisent le rafraîchissement de page, la supervision et le proxy amont.
 func (s *server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte("ok\n"))
+	if _, ok := s.index(); ok {
+		_, _ = w.Write([]byte("ok\n"))
+		return
+	}
+	w.Header().Set("Retry-After", "5")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	if e := s.loadErr.Load(); e != nil {
+		_, _ = w.Write([]byte("erreur: " + *e + "\n"))
+		return
+	}
+	_, _ = w.Write([]byte("préchauffage\n"))
+}
+
+// warmingGate rend true (et a écrit la réponse) si l'index n'est pas encore prêt : les routes
+// d'API répondent alors 503 + JSON {"status":"warming"} (ou l'erreur de chargement) avec un
+// en-tête Retry-After, sans jamais toucher l'index. Il rend false quand l'index est prêt.
+func (s *server) warmingGate(w http.ResponseWriter) bool {
+	if _, ok := s.index(); ok {
+		return false
+	}
+	w.Header().Set("Retry-After", "5")
+	if e := s.loadErr.Load(); e != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "error", "error": *e})
+		return true
+	}
+	s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "warming"})
+	return true
 }
 
 // handleSearch embarque la requête utilisateur : borne de taille, limitation de débit,
@@ -109,6 +183,9 @@ func (s *server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 // puis rendu JSON. Toute valeur issue de l'utilisateur transite exclusivement en JSON encodé
 // (échappement natif) ; le serveur ne concatène jamais d'entrée dans du HTML.
 func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	if s.warmingGate(w) {
+		return
+	}
 	ip := clientIP(r, s.trustProxy)
 	if !s.lim.allow(ip) {
 		s.writeError(w, http.StatusTooManyRequests, "trop de requêtes")
@@ -137,8 +214,16 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idx, ok := s.index()
+	if !ok {
+		// Bascule en préchauffage entre la garde d'entrée et ce point : réponse cohérente 503.
+		w.Header().Set("Retry-After", "5")
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "warming"})
+		return
+	}
+
 	tSearch := time.Now()
-	res, err := s.idx.Search(ctx, vec, s.topK)
+	res, err := idx.Search(ctx, vec, s.topK)
 	if err != nil {
 		s.log.Error("recherche échouée", "ip", ip, "err", err.Error())
 		s.writeError(w, http.StatusInternalServerError, "recherche indisponible")
@@ -173,6 +258,9 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 // borne l'entrée, sert le cache, et rend TOUJOURS un JSON en 200 (champs vides + error en cas
 // d'échec) pour que le panneau se dégrade gracieusement, jamais un 500.
 func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
+	if s.warmingGate(w) {
+		return
+	}
 	ip := clientIP(r, s.trustProxy)
 	if !s.lim.allow(ip) {
 		s.writeError(w, http.StatusTooManyRequests, "trop de requêtes")

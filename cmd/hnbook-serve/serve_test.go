@@ -99,15 +99,17 @@ func newTestServer(t *testing.T, idx *horosvec.Index, embedURL string, rate, bur
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	return &server{
-		idx:        idx,
+	s := &server{
 		embed:      &embedClient{url: embedURL, hc: &http.Client{Timeout: 2 * time.Second}},
 		lim:        newIPLimiter(ctx, rate, burst),
 		reqTimeout: 5 * time.Second,
 		topK:       10,
 		html:       []byte("<html></html>"),
+		warming:    []byte("<html>warming</html>"),
 		log:        slog.New(slog.NewJSONHandler(io.Discard, nil)),
 	}
+	s.setIndex(idx)
+	return s
 }
 
 func doSearch(t *testing.T, srv *server, q string) *http.Response {
@@ -301,13 +303,121 @@ func TestClientIP(t *testing.T) {
 	}
 }
 
-// TestHealthz vérifie la sonde de vivacité.
+// TestHealthz vérifie que /healthz est une sonde de disponibilité : 200 une fois l'index prêt.
 func TestHealthz(t *testing.T) {
-	srv := &server{log: slog.New(slog.NewJSONHandler(io.Discard, nil))}
+	idx, q0 := buildTestIndex(t, 50)
+	side := fakeSidecar(t, q0)
+	srv := newTestServer(t, idx, side.URL, 100, 100)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 	srv.handleHealthz(rec, req)
 	if rec.Result().StatusCode != http.StatusOK {
-		t.Fatalf("healthz statut %d != 200", rec.Result().StatusCode)
+		t.Fatalf("healthz prêt: statut %d != 200", rec.Result().StatusCode)
+	}
+}
+
+// TestWarmingState est le test DÉCIDABLE de l'état préchauffage : un serveur dont l'index n'est
+// pas encore publié rend 200 + page de préchauffage sur GET /, 503 + {"status":"warming"} +
+// Retry-After sur /api/search et /api/preview, et 503 sur /healthz ; après bascule à prêt,
+// /api/search répond normalement et /healthz vaut 200.
+func TestWarmingState(t *testing.T) {
+	side := fakeSidecar(t, make([]float32, embedDim))
+	srv := &server{
+		embed:      &embedClient{url: side.URL, hc: &http.Client{Timeout: 2 * time.Second}},
+		lim:        newIPLimiter(context.Background(), 100, 100),
+		reqTimeout: 5 * time.Second,
+		topK:       10,
+		html:       []byte("<html>prêt</html>"),
+		warming:    []byte("<html>préchauffage</html>"),
+		log:        slog.New(slog.NewJSONHandler(io.Discard, nil)),
+	}
+
+	// État préchauffage : index non publié.
+	rec := httptest.NewRecorder()
+	srv.handleIndex(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	res := rec.Result()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET / en préchauffage: statut %d != 200", res.StatusCode)
+	}
+	if body, _ := io.ReadAll(res.Body); string(body) != "<html>préchauffage</html>" {
+		t.Fatalf("GET / en préchauffage ne rend pas la page warming: %q", body)
+	}
+
+	rec = httptest.NewRecorder()
+	srv.handleSearch(rec, httptest.NewRequest(http.MethodGet, "/api/search?q=x", nil))
+	res = rec.Result()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("/api/search en préchauffage: statut %d != 503", res.StatusCode)
+	}
+	if res.Header.Get("Retry-After") != "5" {
+		t.Fatalf("/api/search en préchauffage: Retry-After=%q != 5", res.Header.Get("Retry-After"))
+	}
+	var warmBody map[string]string
+	if err := json.NewDecoder(res.Body).Decode(&warmBody); err != nil {
+		t.Fatal(err)
+	}
+	if warmBody["status"] != "warming" {
+		t.Fatalf("/api/search en préchauffage: status=%q != warming", warmBody["status"])
+	}
+
+	rec = httptest.NewRecorder()
+	srv.handlePreview(rec, httptest.NewRequest(http.MethodGet, "/api/preview?url=x", nil))
+	if rec.Result().StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("/api/preview en préchauffage: statut %d != 503", rec.Result().StatusCode)
+	}
+
+	rec = httptest.NewRecorder()
+	srv.handleHealthz(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Result().StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("/healthz en préchauffage: statut %d != 503", rec.Result().StatusCode)
+	}
+
+	// Bascule à prêt.
+	idx, _ := buildTestIndex(t, 50)
+	srv.setIndex(idx)
+
+	rec = httptest.NewRecorder()
+	srv.handleHealthz(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Result().StatusCode != http.StatusOK {
+		t.Fatalf("/healthz une fois prêt: statut %d != 200", rec.Result().StatusCode)
+	}
+
+	rec = httptest.NewRecorder()
+	srv.handleSearch(rec, httptest.NewRequest(http.MethodGet, "/api/search?q=x", nil))
+	if rec.Result().StatusCode != http.StatusOK {
+		t.Fatalf("/api/search une fois prêt: statut %d != 200", rec.Result().StatusCode)
+	}
+}
+
+// TestWarmingLoadError vérifie qu'un échec de chargement bascule les routes en 503 avec message
+// d'erreur (jamais un préchauffage éternel qui prétendrait la disponibilité imminente).
+func TestWarmingLoadError(t *testing.T) {
+	srv := &server{
+		lim:     newIPLimiter(context.Background(), 100, 100),
+		html:    []byte("<html>prêt</html>"),
+		warming: []byte("<html>préchauffage</html>"),
+		log:     slog.New(slog.NewJSONHandler(io.Discard, nil)),
+	}
+	msg := "chargement de l'index impossible"
+	srv.loadErr.Store(&msg)
+
+	rec := httptest.NewRecorder()
+	srv.handleHealthz(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Result().StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("/healthz en erreur: statut %d != 503", rec.Result().StatusCode)
+	}
+
+	rec = httptest.NewRecorder()
+	srv.handleSearch(rec, httptest.NewRequest(http.MethodGet, "/api/search?q=x", nil))
+	res := rec.Result()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("/api/search en erreur: statut %d != 503", res.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["status"] != "error" {
+		t.Fatalf("/api/search en erreur: status=%q != error", body["status"])
 	}
 }

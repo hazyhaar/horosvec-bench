@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/hazyhaar/horosvec"
 )
 
 // newPreviewTestServer construit un serveur minimal apte à servir /api/preview : un limiteur
@@ -21,10 +23,22 @@ func newPreviewTestServer(t *testing.T) *server {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	return &server{
+	s := &server{
 		lim: newIPLimiter(ctx, 100, 100),
 		log: slog.New(slog.NewJSONHandler(io.Discard, nil)),
 	}
+	// La prévisualisation n'utilise pas l'index, mais elle est gardée par le drapeau de
+	// disponibilité : publier un index-stub place le serveur en état « prêt » pour ces tests.
+	s.setIndex(stubSearcher{})
+	return s
+}
+
+// stubSearcher est un index-stub (frontière, non une donnée métier truquée) : il satisfait
+// l'interface searcher sans jamais être appelé par les tests de prévisualisation.
+type stubSearcher struct{}
+
+func (stubSearcher) Search(context.Context, []float32, int) ([]horosvec.Result, error) {
+	return nil, nil
 }
 
 func doPreview(t *testing.T, srv *server, rawURL string) previewResult {
