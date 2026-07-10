@@ -288,3 +288,86 @@ plafond mesuré est donc purement CPU/verrou logiciel. Au 26,7 M réel (~54 Go >
 mode SQLite ajouterait des défauts de page disque en cache froid : son plateau
 s'écroulerait plus bas encore, et l'écart avec l'arène se creuserait. Le dimensionnement du
 pool n'y changerait rien, la limite étant en amont.
+
+## Sharding modernc : in-process scale-out — la sérialisation est-elle par-DB ou globale ?
+
+Question tranchée par un micro-banc autonome (`cmd/shard-scaleout`, ne dépend PAS de
+l'index horosvec) : la sérialisation des lectures de `modernc.org/sqlite` vit-elle PAR
+`*sql.DB` (le sharding in-process la lèverait) ou est-elle GLOBALE au process (il faudrait
+des process séparés) ? N fichiers SQLite indépendants portent chacun une tranche des
+200 000 vecteurs (table `{node_id, vec BLOB}`, WAL, mêmes pragmas DSN par connexion) ; N
+`*sql.DB` distincts sont ouverts dans UN process ; 32 goroutines lectrices (concurrence
+fixe) font des `SELECT vec WHERE node_id=?` aléatoires réparties sur les N shards, cache
+chaud (warm-up 500 lectures/goroutine). N varie ; on mesure le débit agrégé de lectures.
+
+Note de comparabilité : ce micro-banc mesure des lectures de blob UNITAIRES (une ligne par
+`SELECT`), pas des `Search` complets (une recherche horosvec enchaîne marche de graphe +
+re-classement de K candidats, soit des dizaines de lectures de blob). Les valeurs absolues
+ne se comparent donc PAS aux ~37-40 kQPS de `Search` ; c'est le SCALING avec N et le
+plafond de la PRIMITIVE de lecture qui sont l'objet.
+
+### Sortie collée (deux runs, reproductibilité ; machine 32 cœurs)
+
+```
+# run 1                              # run 2
+N  qps_agrégé   p50    p99          N  qps_agrégé   p50    p99
+1   578973     0.019  0.362         1   639344     0.015  0.324
+2  1071530     0.009  0.217         2   970239     0.010  0.257
+4  1958506     0.007  0.103         4  1978505     0.007  0.102
+8  1648734     0.007  0.188         8  1928495     0.006  0.158
+16 1909888     0.006  0.176         16 1793876     0.006  0.189
+32  351009     0.029  0.870         32  353479     0.029  0.870
+# N=32, pool-per-shard réduit à 4 : 427842 QPS (toujours effondré)
+```
+
+### Tableau — débit agrégé vs nombre de shards (moyenne des deux runs)
+
+| N shards | QPS agrégé | ratio vs mono-instance (N=1) |
+|---|---|---|
+| 1  | ~609 000  | 1.00× (référence) |
+| 2  | ~1 021 000 | 1.68× |
+| 4  | **~1 968 000** | **3.23×** |
+| 8  | ~1 789 000 | 2.94× |
+| 16 | ~1 852 000 | 3.04× |
+| 32 | ~352 000  | 0.58× (effondrement) |
+
+### Réponse binaire
+
+**La sérialisation est PAR-`*sql.DB`, pas globale au process.** Deux faits décisifs :
+
+1. Une base UNIQUE encaisse déjà **~600 000 lectures de blob/s** à concurrence 32 —
+   modernc **ne sérialise donc PAS les lectures à ~37-40 k**. Le plateau de `Search`
+   observé dans les sections précédentes ne vient PAS du chemin de lecture de modernc ;
+   il vit dans le chemin chaud propre à horosvec (verrous du plan/cache, multiplicité de
+   petites requêtes par recherche).
+2. Le sharding in-process **LÈVE le débit ×3,2** (609 k → ~1,97 M à N=4). Si un verrou
+   global au process régnait, N shards ne changeraient rien ; ils multiplient le débit,
+   donc chaque `*sql.DB` sérialise pour son compte et les shards progressent en parallèle.
+
+Mais le scale-out a un **point idéal étroit** : le pic est à **N=4-8** (~2 M lectures/s,
+soit la saturation des cœurs), un plateau tient de 4 à 16, puis N=32 **s'effondre à 0,58×**
+(reproductible, et à peine amélioré en réduisant le pool par shard). Au-delà du point idéal,
+le coût fixe par base (mmap, WAL, pool, fragmentation du working set sur beaucoup de petites
+bases) domine et détruit le gain. Le bonus « process séparés » est **inutile pour trancher**
+la question posée : puisque l'in-process scale déjà par-DB, aucun verrou global au process
+n'existe ; des process séparés ne serviraient qu'à repousser le point idéal (pression GC,
+adresses mmap) au-delà de N=8, non à débloquer un verrou qui n'existe pas.
+
+### Verdict
+
+**Oui, le sharding SQLite in-process permet de dépasser le plafond mono-instance** (×3,2 au
+point idéal N=4-8) **et il préserve l'insertion incrémentale** — chaque shard est une base
+SQLite normale, inscriptible ligne à ligne, sans arène figée. La couche de stockage SQLite
+n'est PAS le facteur limitant : sa primitive de lecture (~600 k-2 M blobs/s) dépasse de
+loin ce dont un service de recherche a besoin. **Mais** exploiter ce gain exige de sharder
+l'INDEX lui-même (N sous-index, un `*sql.DB` chacun) — un changement d'architecture, pas un
+simple réglage — et de tenir le nombre de shards au point idéal (≈ nombre de cœurs / 4 à 8
+ici), sous peine d'effondrement. Le débit de l'arène (~72 kQPS de `Search`) devient dès lors
+atteignable par un db-blob shardé tout en gardant l'incrémentalité, au prix de cette
+refonte en sous-index.
+
+**Rappel du caveat d'échelle** : mesuré à 200 000 vecteurs, tout en page cache RAM — aucun
+accès disque. Le pic ~2 M lectures/s est purement CPU. Au 26,7 M réel (~54 Go > RAM), les
+lectures de blob des shards en cache froid ajouteraient des défauts de page disque ; le
+point idéal se déplacerait et le gain de sharding serait plafonné par la bande passante du
+stockage, pas par les cœurs. Le scale-out mesuré ici borne par le haut le bénéfice réel.
