@@ -10,11 +10,12 @@
     --fg: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --score: #3fb950;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body {
     margin: 0; background: var(--bg); color: var(--fg);
     font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
-  main { max-width: 1100px; margin: 0 auto; padding: 2.25rem 1.25rem 3rem; }
+  main { max-width: 1500px; margin: 0 auto; padding: 2.25rem 2rem 3rem; }
   h1 { font-size: 1.5rem; font-weight: 600; margin: 0 0 .25rem; }
   .lede { color: var(--muted); margin: 0 0 1.25rem; font-size: .95rem; }
   .banner {
@@ -35,13 +36,37 @@
   .meta { color: var(--muted); font-size: .85rem; min-height: 1.2rem; margin-bottom: 1rem; }
   .meta.err { color: #f85149; }
 
-  .split { display: flex; gap: 1.25rem; align-items: flex-start; }
-  .col-left { flex: 1 1 44%; min-width: 0; }
+  .split { display: flex; gap: 1.5rem; align-items: flex-start; }
+  .col-left { flex: 1 1 42%; min-width: 0; }
   .col-right {
-    flex: 1 1 56%; min-width: 0; position: sticky; top: 1rem;
+    flex: 1 1 58%; min-width: 0; position: sticky; top: 1rem;
     background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
     padding: 1.1rem 1.2rem; min-height: 240px;
   }
+
+  .listbar {
+    display: flex; align-items: center; justify-content: space-between; gap: .75rem;
+    flex-wrap: wrap; margin-bottom: .7rem;
+  }
+  .listbar label { color: var(--muted); font-size: .82rem; }
+  select#sort {
+    color: var(--fg); background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: .35rem .5rem; font-size: .82rem;
+  }
+  select#sort:focus { outline: none; border-color: var(--accent); }
+  .sort-note { color: var(--muted); font-size: .74rem; line-height: 1.4; }
+
+  .pager {
+    display: flex; align-items: center; justify-content: center; gap: .8rem;
+    margin-top: .9rem; color: var(--muted); font-size: .84rem;
+  }
+  .pager button {
+    padding: .4rem .8rem; font-size: .82rem; font-weight: 600;
+    background: var(--panel-hi); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; cursor: pointer;
+  }
+  .pager button:disabled { opacity: .4; cursor: default; }
+  .pager .page-ind { font-variant-numeric: tabular-nums; }
 
   ol { list-style: none; padding: 0; margin: 0; }
   li.card {
@@ -53,7 +78,9 @@
   li.card.active { border-color: var(--accent); background: var(--panel-hi); }
   li.card .head { display: flex; justify-content: space-between; gap: .6rem; align-items: baseline; }
   li.card .title { color: var(--fg); font-size: .98rem; font-weight: 500; }
-  li.card .score { color: var(--score); font-size: .78rem; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+  li.card .meta-right { display: flex; gap: .55rem; align-items: baseline; flex: 0 0 auto; }
+  li.card .score { color: var(--score); font-size: .78rem; font-variant-numeric: tabular-nums; }
+  li.card .date { color: var(--muted); font-size: .76rem; font-variant-numeric: tabular-nums; }
   li.card .preview { color: var(--muted); font-size: .82rem; margin-top: .3rem; line-height: 1.45; }
 
   .detail-empty { color: var(--muted); font-size: .92rem; }
@@ -105,7 +132,23 @@
 
   <div class="split">
     <div class="col-left">
+      <div class="listbar" id="listbar" hidden>
+        <div>
+          <label for="sort">Trier :</label>
+          <select id="sort">
+            <option value="relevance">Pertinence</option>
+            <option value="recent">Plus récent</option>
+            <option value="oldest">Plus ancien</option>
+          </select>
+        </div>
+        <div class="sort-note" id="sortNote"></div>
+      </div>
       <ol id="results"></ol>
+      <div class="pager" id="pager" hidden>
+        <button id="prev" type="button">‹ Précédent</button>
+        <span class="page-ind" id="pageInd"></span>
+        <button id="next" type="button">Suivant ›</button>
+      </div>
     </div>
     <div class="col-right" id="detail">
       <p class="detail-empty">Sélectionner un résultat pour l'afficher.</p>
@@ -127,6 +170,24 @@
   var meta = document.getElementById("meta");
   var results = document.getElementById("results");
   var detail = document.getElementById("detail");
+  var listbar = document.getElementById("listbar");
+  var sortSel = document.getElementById("sort");
+  var sortNote = document.getElementById("sortNote");
+  var pager = document.getElementById("pager");
+  var prevBtn = document.getElementById("prev");
+  var nextBtn = document.getElementById("next");
+  var pageInd = document.getElementById("pageInd");
+
+  // Nombre de voisins demandés au serveur (borné à 100 côté serveur), taille d'une page affichée.
+  var REQUEST_K = 60;
+  var PAGE_SIZE = 10;
+
+  // État de la vue courante : l'ensemble des résultats retournés par le serveur (ordre pertinence
+  // d'origine préservé), le tri actif et la page affichée. La pagination et le tri sont ENTIÈREMENT
+  // côté navigateur sur cet ensemble déjà récupéré ; le serveur n'est plus resollicité.
+  var allResults = [];   // [{id, score}] dans l'ordre pertinence rendu par le serveur
+  var currentSort = "relevance";
+  var currentPage = 0;
 
   // Cache mémoire id -> item HN (ou null si supprimé/introuvable).
   var itemCache = new Map();
@@ -172,6 +233,46 @@
   function titleOf(item, id) {
     if (item && item.title) { return item.title; }
     return "item " + id;
+  }
+
+  // itemTime rend l'epoch (secondes) d'un item, ou null si absent/supprimé — clé du tri par date.
+  function itemTime(item) {
+    return (item && typeof item.time === "number") ? item.time : null;
+  }
+
+  // dateOf rend une date courte lisible (JJ/MM/AAAA) depuis l'epoch de l'item, ou "" si absente.
+  function dateOf(item) {
+    var t = itemTime(item);
+    if (t === null) { return ""; }
+    var d = new Date(t * 1000);
+    var dd = String(d.getDate()).padStart(2, "0");
+    var mm = String(d.getMonth() + 1).padStart(2, "0");
+    return dd + "/" + mm + "/" + d.getFullYear();
+  }
+
+  // prefetchItems précharge les items d'une liste d'ids en concurrence BORNÉE (pool de POOL en
+  // vol au plus), pour que le tri par date dispose des dates sans marteler l'API HN de 60 fetch
+  // simultanés. Les ids déjà en cache ne repartent pas. Retourne une promesse résolue quand tout
+  // est chargé. onEach est appelé après chaque item résolu (permet de re-trier au fil de l'eau).
+  var POOL = 8;
+  function prefetchItems(ids, onEach) {
+    var queue = ids.slice();
+    return new Promise(function (resolve) {
+      var inFlight = 0, done = 0, total = queue.length;
+      if (total === 0) { resolve(); return; }
+      function pump() {
+        while (inFlight < POOL && queue.length > 0) {
+          var id = queue.shift();
+          inFlight++;
+          fetchItem(id).then(function () {
+            inFlight--; done++;
+            if (onEach) { onEach(); }
+            if (done === total) { resolve(); } else { pump(); }
+          });
+        }
+      }
+      pump();
+    });
   }
 
   // safeExternalUrl rend l'URL cible d'un item si elle est http(s) et pointe vers un hôte
@@ -336,11 +437,17 @@
     var title = document.createElement("span");
     title.className = "title";
     title.textContent = "item " + id; // placeholder le temps du fetch
+    var metaRight = document.createElement("div");
+    metaRight.className = "meta-right";
+    var date = document.createElement("span");
+    date.className = "date";
     var score = document.createElement("span");
     score.className = "score";
     score.textContent = "d² " + Number(res.score).toFixed(3);
+    metaRight.appendChild(date);
+    metaRight.appendChild(score);
     head.appendChild(title);
-    head.appendChild(score);
+    head.appendChild(metaRight);
     li.appendChild(head);
 
     var preview = document.createElement("div");
@@ -350,13 +457,64 @@
     li.addEventListener("click", function () { selectCard(li, id); });
     results.appendChild(li);
 
-    // Enrichissement asynchrone : titre + aperçu réels.
+    // Enrichissement asynchrone : titre + date + aperçu réels. La date est déjà connue si
+    // l'item a été préchargé par le pool ; sinon le fetch (mémoïsé) la fournit.
     fetchItem(id).then(function (item) {
       title.textContent = titleOf(item, id); // textContent : aucune injection possible
+      date.textContent = dateOf(item);       // textContent : anti-XSS
       preview.textContent = previewOf(item, id);
     });
     return li;
   }
+
+  // sortedResults rend une COPIE de allResults ordonnée selon le tri actif. Le tri par date
+  // s'appuie sur les items en cache (préchargés) ; les items sans date connue (supprimés, nuls,
+  // ou pas encore chargés) sont poussés en fin. Le tri « pertinence » restitue l'ordre serveur.
+  function sortedResults() {
+    if (currentSort === "relevance") { return allResults.slice(); }
+    var recent = currentSort === "recent";
+    return allResults.slice().sort(function (a, b) {
+      var ta = itemTime(itemCache.get(String(a.id)));
+      var tb = itemTime(itemCache.get(String(b.id)));
+      if (ta === null && tb === null) { return 0; }
+      if (ta === null) { return 1; }   // sans date -> fin
+      if (tb === null) { return -1; }
+      return recent ? (tb - ta) : (ta - tb);
+    });
+  }
+
+  // renderPage rend la tranche PAGE_SIZE de la page courante, en tenant compte du tri actif, et
+  // met à jour l'indicateur de page et l'état des boutons.
+  function renderPage() {
+    var ordered = sortedResults();
+    var total = ordered.length;
+    var pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    if (currentPage >= pages) { currentPage = pages - 1; }
+    if (currentPage < 0) { currentPage = 0; }
+
+    results.innerHTML = "";
+    var start = currentPage * PAGE_SIZE;
+    var slice = ordered.slice(start, start + PAGE_SIZE);
+    slice.forEach(function (res) { buildCard(res); });
+
+    pageInd.textContent = "Page " + (currentPage + 1) + " / " + pages
+      + " · " + total + " résultats";
+    prevBtn.disabled = currentPage === 0;
+    nextBtn.disabled = currentPage >= pages - 1;
+    pager.hidden = total <= PAGE_SIZE;
+  }
+
+  prevBtn.addEventListener("click", function () {
+    if (currentPage > 0) { currentPage--; renderPage(); }
+  });
+  nextBtn.addEventListener("click", function () {
+    currentPage++; renderPage();
+  });
+  sortSel.addEventListener("change", function () {
+    currentSort = sortSel.value;
+    currentPage = 0;
+    renderPage();
+  });
 
   form.addEventListener("submit", function (ev) {
     ev.preventDefault();
@@ -366,9 +524,13 @@
     meta.className = "meta";
     meta.textContent = "Recherche en cours…";
     results.innerHTML = "";
+    listbar.hidden = true;
+    pager.hidden = true;
+    allResults = [];
+    currentPage = 0;
     detail.innerHTML = "<p class=\"detail-empty\">Sélectionner un résultat pour l'afficher.</p>";
 
-    fetch("/api/search?q=" + encodeURIComponent(q))
+    fetch("/api/search?q=" + encodeURIComponent(q) + "&k=" + REQUEST_K)
       .then(function (r) {
         if (r.status === 429) { throw new Error("Trop de requêtes — patienter un instant."); }
         if (r.status === 503) { throw new Error("Service d'embedding indisponible."); }
@@ -381,7 +543,29 @@
         meta.textContent = n + " résultats · " + data.latency_ms.toFixed(1)
           + " ms (dont embedding " + data.embed_ms.toFixed(1) + " ms)";
         if (n === 0) { meta.textContent = "Aucun résultat."; return; }
-        list.forEach(function (res) { buildCard(res); });
+
+        allResults = list.map(function (res) { return { id: res.id, score: res.score }; });
+        // Libellé honnête : le tri porte sur les N résultats pertinents retrouvés, jamais sur
+        // le corpus global de 26,7 M items.
+        sortNote.textContent = "Tri des " + n + " résultats pertinents retrouvés (pas du corpus global).";
+        listbar.hidden = false;
+        currentSort = "relevance";
+        sortSel.value = "relevance";
+
+        // Peuple la page courante en priorité (ses ids), puis complète le reste en fond pour
+        // que le tri par date dispose de toutes les dates. Concurrence bornée (pool).
+        var allIds = allResults.map(function (r2) { return String(r2.id); });
+        var firstIds = allIds.slice(0, PAGE_SIZE);
+        var restIds = allIds.slice(PAGE_SIZE);
+        renderPage();
+        prefetchItems(firstIds, null).then(function () {
+          // Recharge la page visible (dates fraîchement connues) sans re-fetch (cache mémoïsé).
+          if (currentSort !== "relevance") { renderPage(); }
+          prefetchItems(restIds, null).then(function () {
+            // Toutes les dates sont connues : rafraîchit la page si un tri par date est actif.
+            if (currentSort !== "relevance") { renderPage(); }
+          });
+        });
       })
       .catch(function (e) {
         meta.className = "meta err";

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,30 @@ const maxPreviewURLParamLen = previewMaxURLLen
 // maxQueryBytes borne la taille du texte de requête accepté (anti-abus). Au-delà, la requête
 // est rejetée (400) avant tout travail d'embedding ou de recherche.
 const maxQueryBytes = 512
+
+// maxTopK plafonne le nombre de voisins qu'un appelant peut demander via le paramètre k
+// (anti-abus : borne raisonnable, PAS illimité). La démo publique pagine côté navigateur sur
+// cet ensemble ; au-delà, la valeur est écrêtée sans erreur.
+const maxTopK = 100
+
+// parseTopK résout le nombre de voisins demandés à partir du paramètre k de la requête. Absent,
+// vide ou invalide (non entier, <= 0) => fallback (topK configuré au démarrage). Au-delà de
+// maxTopK, la valeur est écrêtée à maxTopK. La forme de réponse reste inchangée : seul le nombre
+// de résultats varie.
+func parseTopK(raw string, fallback int) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	if n > maxTopK {
+		return maxTopK
+	}
+	return n
+}
 
 // searcher est l'interface de recherche consommée par le serveur, définie côté consommateur.
 // L'implémentation de production est *horosvec.Index (mode arène) ; les tests fournissent un
@@ -222,8 +247,10 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	topK := parseTopK(r.URL.Query().Get("k"), s.topK)
+
 	tSearch := time.Now()
-	res, err := idx.Search(ctx, vec, s.topK)
+	res, err := idx.Search(ctx, vec, topK)
 	if err != nil {
 		s.log.Error("recherche échouée", "ip", ip, "err", err.Error())
 		s.writeError(w, http.StatusInternalServerError, "recherche indisponible")

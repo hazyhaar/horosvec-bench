@@ -120,6 +120,71 @@ func doSearch(t *testing.T, srv *server, q string) *http.Response {
 	return rec.Result()
 }
 
+// doSearchK est la variante de doSearch qui transmet le paramètre k (nombre de voisins demandés).
+func doSearchK(t *testing.T, srv *server, q, k string) *http.Response {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q="+url.QueryEscape(q)+"&k="+url.QueryEscape(k), nil)
+	rec := httptest.NewRecorder()
+	srv.handleSearch(rec, req)
+	return rec.Result()
+}
+
+// TestParseTopK vérifie la résolution et l'écrêtage du paramètre k au niveau unitaire.
+func TestParseTopK(t *testing.T) {
+	cases := []struct {
+		raw      string
+		fallback int
+		want     int
+	}{
+		{"", 10, 10},         // absent -> fallback
+		{"  ", 10, 10},       // vide -> fallback
+		{"abc", 10, 10},      // invalide -> fallback
+		{"0", 10, 10},        // <= 0 -> fallback
+		{"-5", 10, 10},       // négatif -> fallback
+		{"60", 10, 60},       // valide dans la borne
+		{"100", 10, 100},     // à la borne
+		{"500", 10, 100},     // au-delà -> écrêté à maxTopK
+		{"1000000", 10, 100}, // très grand -> écrêté
+	}
+	for _, c := range cases {
+		if got := parseTopK(c.raw, c.fallback); got != c.want {
+			t.Errorf("parseTopK(%q,%d)=%d, attendu %d", c.raw, c.fallback, got, c.want)
+		}
+	}
+}
+
+// TestSearchKCap vérifie de bout en bout que k demandé au-delà du plafond est écrêté à maxTopK
+// sans erreur, et qu'un k dans la borne est honoré.
+func TestSearchKCap(t *testing.T) {
+	idx, q0 := buildTestIndex(t, 300)
+	side := fakeSidecar(t, q0)
+	srv := newTestServer(t, idx, side.URL, 100, 100)
+
+	resp := doSearchK(t, srv, "sujet de test", "60")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("k=60: statut %d != 200", resp.StatusCode)
+	}
+	var out searchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 60 {
+		t.Fatalf("k=60: résultats %d != 60", len(out.Results))
+	}
+
+	resp = doSearchK(t, srv, "sujet de test", "500")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("k=500: statut %d != 200", resp.StatusCode)
+	}
+	var capped searchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&capped); err != nil {
+		t.Fatal(err)
+	}
+	if len(capped.Results) != maxTopK {
+		t.Fatalf("k=500: résultats %d != %d (écrêtage attendu)", len(capped.Results), maxTopK)
+	}
+}
+
 // TestSearchOK vérifie qu'une recherche nominale rend un top-K non vide, une latence
 // renseignée, et l'ext_id du corpus (le plus proche du vecteur d'un item est l'item lui-même).
 func TestSearchOK(t *testing.T) {
