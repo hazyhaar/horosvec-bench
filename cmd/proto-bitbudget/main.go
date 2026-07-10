@@ -167,6 +167,18 @@ type codeMulti struct {
 	sqNorm float64
 }
 
+// codeExt is a FAITHFUL Extended-RaBitQ code (arXiv:2409.09913 family).
+// c[i] in {0..2^B-1}, reconstructed level ell(c)=2c-(2^B-1) (odd symmetric grid:
+// B=1 -> {-1,+1} = sign, so the MSB concatenation == the 1-bit RaBitQ code).
+// G = Sum ell(c_i)*o'_i is the per-vector RaBitQ correction factor <ell,o'>
+// (generalizes L1). The asymmetric estimator reduces EXACTLY to the engine's
+// 1-bit rabitqDistanceAsym at B=1 (ell=sign, G=L1).
+type codeExt struct {
+	c      []uint8
+	G      float64
+	sqNorm float64
+}
+
 func l2sq(a, b []float32) float64 {
 	var s float64
 	for i := range a {
@@ -223,8 +235,10 @@ func main() {
 	Bs := []int{1, 2, 3, 4, 5, 6, 7, 8}
 	codes1 := make([]code1bit, nBase)
 	codesM := make(map[int][]codeMulti, len(Bs))
+	codesE := make(map[int][]codeExt, len(Bs))
 	for _, B := range Bs {
 		codesM[B] = make([]codeMulti, nBase)
+		codesE[B] = make([]codeExt, nBase)
 	}
 	parallelForChunked(nBase, func(i int) {
 		scratch := make([]float64, cd)
@@ -269,6 +283,28 @@ func main() {
 				q[j] = uint8(li)
 			}
 			codesM[B][i] = codeMulti{q: q, scaleA: A, sqNorm: sq}
+
+			// FAITHFUL Extended-RaBitQ code: same B-bit code index c, but the
+			// estimator uses odd symmetric levels ell(c)=2c-(2^B-1) and the
+			// per-vector correction G=<ell,o'>. Reconstruct c on the SAME grid.
+			ce := make([]uint8, cd)
+			var G float64
+			off := float64(levels) // 2^B-1
+			for j := 0; j < cd; j++ {
+				// map o'_j in [-A,A] to c in {0..levels}; MSB(c)=sign(o'_j)
+				t := (float64(x[j])/A + 1) / 2 * off
+				li := int(math.Round(t))
+				if li < 0 {
+					li = 0
+				}
+				if li > levels {
+					li = levels
+				}
+				ce[j] = uint8(li)
+				ell := float64(2*li - levels) // odd symmetric level
+				G += ell * float64(x[j])
+			}
+			codesE[B][i] = codeExt{c: ce, G: G, sqNorm: sq}
 		}
 	})
 
@@ -339,6 +375,28 @@ func main() {
 		rows = append(rows, row{fmt.Sprintf("B=%d bits, NO rerank", B), sum / float64(nQuery), bytesPV})
 	}
 
+	// B-bit FAITHFUL Extended-RaBitQ, NO rerank
+	var rowsE []row
+	for _, B := range Bs {
+		var sum float64
+		var mu sync.Mutex
+		ce := codesE[B]
+		parallelFor(nQuery, func(qi int) {
+			q := qRot[qi]
+			qsq := l2sq(q, make([]float32, cd))
+			levels := (1 << uint(B)) - 1
+			got := topKByScore(nBase, k, func(i int) float64 {
+				return estimateExt(q, qsq, ce[i], levels)
+			})
+			rec := recallAt(got, gt[qi])
+			mu.Lock()
+			sum += rec
+			mu.Unlock()
+		})
+		bytesPV := B*cd/8 + 8 // code + G(f32)+sqNorm(f32)
+		rowsE = append(rowsE, row{fmt.Sprintf("B=%d bits Ext-RaBitQ, NO rerank", B), sum / float64(nQuery), bytesPV})
+	}
+
 	// ---- report ----
 	fmt.Printf("\n=== proto-bitbudget — corpus=%s  n_base=%d  n_query=%d  dim=%d codeDim=%d  k=%d ===\n",
 		arenaPath, nBase, nQuery, dim, cd, k)
@@ -348,6 +406,13 @@ func main() {
 		fmt.Printf("%-42s  %10.4f  %14d\n", r.name, r.recall, r.bytesPV)
 	}
 	fmt.Printf("%-42s  %10.4f  %14d\n", "exact fp32 (by construction)", 1.0, 2048)
+
+	fmt.Printf("\n--- FAITHFUL Extended-RaBitQ estimator (odd levels + <ell,o'> correction) ---\n")
+	fmt.Printf("%-42s  %10s  %14s\n", "regime", "recall@10", "bytes/vector")
+	for _, r := range rowsE {
+		fmt.Printf("%-42s  %10.4f  %14d\n", r.name, r.recall, r.bytesPV)
+	}
+
 	fmt.Printf("\nfp32 rerank store (reference) = %d bytes/vector (dim*4)\n", dim*4)
 	fmt.Fprintf(os.Stderr, "total %s\n", time.Since(t0))
 }
@@ -379,6 +444,21 @@ func estimateMulti(q []float32, qsq float64, c codeMulti, B int) float64 {
 		dot += xq * float64(q[i])
 	}
 	return qsq + c.sqNorm - 2.0*dot
+}
+
+// estimateExt: FAITHFUL Extended-RaBitQ asymmetric estimator.
+// <o',q'> ~= (Sum ell(c_i) q'_i) * sqNorm / G, reducing EXACTLY to the engine's
+// 1-bit estimate at B=1 (ell=sign, G=L1). dist^2 = ||q'||^2 + ||o'||^2 - 2<o',q'>.
+func estimateExt(q []float32, qsq float64, c codeExt, levels int) float64 {
+	if c.G == 0 {
+		return c.sqNorm
+	}
+	var estDot float64
+	for i := range q {
+		ell := float64(2*int(c.c[i]) - levels)
+		estDot += ell * float64(q[i])
+	}
+	return qsq + c.sqNorm - 2.0*estDot*c.sqNorm/c.G
 }
 
 func topKExact(base [][]float32, q []float32, k int) []int {
