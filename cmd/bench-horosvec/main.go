@@ -27,9 +27,25 @@ import (
 // l'incident 2026-07 (opt-in arène silencieux via HOROSVEC_ARENA, deux jours de mesures
 // non attribuables).
 const (
-	modeDBBlob = "db-blob"
-	modeArena  = "arena"
+	modeDBBlob     = "db-blob"
+	modeArena      = "arena"
+	modeDBBlobPool = "db-blob-pool"
 )
+
+// poolSize dimensionne le vivier de connexions read-only tièdes du mode db-blob-pool.
+// Il doit couvrir la concurrence maximale balayée (128) avec une marge : au-delà de
+// database/sql.MaxIdleConns (défaut 2), les connexions ne sont plus fermées/rouvertes
+// en rafale entre requêtes concurrentes.
+const poolSize = 256
+
+// poolDSNPragmas applique à CHAQUE connexion du pool (via le DSN modernc, contrairement
+// au configureSQLite interne de horosvec qui ne touche qu'une connexion) les pragmas de
+// performance : WAL, gros cache, mmap. C'est le levier testé — une connexion « froide »
+// (cache par défaut, sans mmap) ouverte sous concurrence est l'hypothèse du plateau.
+// query_only n'y figure PAS : horosvec.New exécute initSchema (CREATE TABLE) et Build
+// écrit les nœuds ; query_only=ON les ferait échouer sur le handle partagé build+requête.
+const poolDSNPragmas = "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)" +
+	"&_pragma=synchronous(NORMAL)&_pragma=cache_size(-65536)&_pragma=mmap_size(268435456)"
 
 func main() {
 	if err := run(); err != nil {
@@ -41,7 +57,7 @@ func main() {
 func run() error {
 	// Le flag -mode s'enregistre sur le CommandLine par défaut AVANT bench.ParseFlags,
 	// qui appelle flag.Parse() : les deux jeux de flags sont parsés ensemble.
-	modeFlag := flag.String("mode", modeDBBlob, "régime de mesure : arena (rerank fp16 via arène) | db-blob (rerank SQL, défaut)")
+	modeFlag := flag.String("mode", modeDBBlob, "régime de mesure : arena (rerank fp16 via arène) | db-blob (rerank SQL, défaut) | db-blob-pool (rerank SQL, pool dimensionné + pragmas DSN par connexion)")
 	flags := bench.ParseFlags()
 	if err := flags.Validate(); err != nil {
 		return err
@@ -97,8 +113,8 @@ func run() error {
 // avertissement). Le mode retenu est journalisé en clair au démarrage (première ligne
 // slog), jamais laissé silencieux.
 func resolveMode(flagVal string, log *slog.Logger) (string, error) {
-	if flagVal != modeArena && flagVal != modeDBBlob {
-		return "", fmt.Errorf("mode inconnu %q (attendu %s|%s)", flagVal, modeArena, modeDBBlob)
+	if flagVal != modeArena && flagVal != modeDBBlob && flagVal != modeDBBlobPool {
+		return "", fmt.Errorf("mode inconnu %q (attendu %s|%s|%s)", flagVal, modeArena, modeDBBlob, modeDBBlobPool)
 	}
 	explicit := false
 	flag.Visit(func(f *flag.Flag) {
@@ -140,10 +156,43 @@ type horosvecEngine struct {
 }
 
 func (e *horosvecEngine) Name() string {
-	if e.mode == modeArena {
+	switch e.mode {
+	case modeArena:
 		return "horosvec-arena"
+	case modeDBBlobPool:
+		return "horosvec-pool"
+	default:
+		return "horosvec"
 	}
-	return "horosvec"
+}
+
+// poolEnabled indique si la base doit être ouverte avec un vivier de connexions
+// dimensionné et les pragmas de performance appliqués à chaque connexion (mode
+// db-blob-pool). Le chemin de rerank reste le SQL ligne à ligne (pas d'arène).
+func (e *horosvecEngine) poolEnabled() bool {
+	return e.mode == modeDBBlobPool
+}
+
+// openDB ouvre la base temporaire selon le mode. En mode db-blob-pool, le DSN porte les
+// pragmas de performance (appliqués à CHAQUE connexion) et le pool est dimensionné pour
+// couvrir la concurrence maximale sans churn ; sinon l'ouverture est inchangée (une seule
+// connexion tiède via configureSQLite interne, MaxIdleConns par défaut à 2).
+func (e *horosvecEngine) openDB(tmpPath string) (*sql.DB, error) {
+	dsn := tmpPath
+	if e.poolEnabled() {
+		dsn = tmpPath + poolDSNPragmas
+	}
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	if e.poolEnabled() {
+		db.SetMaxOpenConns(poolSize)
+		db.SetMaxIdleConns(poolSize)
+		db.SetConnMaxIdleTime(0) // ne jamais fermer une connexion inactive
+		db.SetConnMaxLifetime(0) // ni la recycler par ancienneté
+	}
+	return db, nil
 }
 
 // arenaEnabled indique si le rerank doit lire l'arène fp16 (mode arène explicite).
@@ -168,7 +217,7 @@ func (e *horosvecEngine) Build(vecs [][]float32) (float64, float64, error) {
 		return 0, 0, fmt.Errorf("close temp: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", tmpPath)
+	db, err := e.openDB(tmpPath)
 	if err != nil {
 		_ = os.Remove(tmpPath)
 		return 0, 0, fmt.Errorf("open sqlite: %w", err)
