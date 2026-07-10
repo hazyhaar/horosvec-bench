@@ -83,4 +83,17 @@ strings hnbook-serve | grep -ci "page\|Plus récent\|pertinence"  -> 630  (> 0)
 N0 zone respectée (index.html, server.go pour le seul cap k, serve_test.go, ce ledger). N1 zéro
 dépendance nouvelle. N2 moteur/preview/embedclient/warming intacts ; forme `/api/search` inchangée.
 N3 zéro innerHTML de donnée distante. N4 zéro secret. N5 aucun redéploiement (binaire bâti, l'architecte
-déploie). N6 fetch HN pool borné (8). N7 tri honnêtement libellé (résultats pertinents).
+déploie). N6 fetch HN pool borné. N7 tri honnêtement libellé (résultats pertinents).
+
+## Auto-audit adversarial (subagent auditeur, secu-deep + quality-bench)
+
+Six lentilles vertes, un finding SOFT sur la lentille 2 (concurrence) : `fetchItem` ne peuplait
+`itemCache` qu'à la résolution, si bien que `buildCard` (10 cartes de la première page) ET
+`prefetchItems(firstIds)` déclenchaient chacun un fetch pour les mêmes ids — double-fetch de la
+première page, pic réel ~18 en vol au lieu du plafond annoncé.
+
+Correctif appliqué : registre `inFlight` (id → Promise) qui dé-duplique les requêtes concurrentes
+du même item ; un id n'est demandé au réseau qu'une fois à la fois, la borne du pool porte alors sur
+des requêtes réellement distinctes. Re-vérifié au sol (harness mock instrumenté) : sur 60 résultats,
+exactement 60 fetch distincts (0 double-fetch), pic in-flight ≤ 12 (jamais 60), le changement de tri
+ne re-fetch rien. `console: []`. Aucun finding hard, aucune faille XSS, cap k non contournable.

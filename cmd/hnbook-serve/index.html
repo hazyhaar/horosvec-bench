@@ -191,6 +191,12 @@
 
   // Cache mémoire id -> item HN (ou null si supprimé/introuvable).
   var itemCache = new Map();
+  // Requêtes en vol id -> Promise, pour DÉ-DUPLIQUER les fetch concurrents du même item : le cache
+  // n'est peuplé qu'à la résolution, donc sans ce registre deux appels simultanés (une carte rendue
+  // ET le pool de préchargement) déclencheraient deux requêtes réseau pour le même id. Le registre
+  // garantit qu'un id n'est demandé au réseau qu'une seule fois à la fois — la borne du pool porte
+  // alors sur des requêtes réellement distinctes.
+  var inFlight = new Map();
 
   function hnLink(id) { return "https://news.ycombinator.com/item?id=" + encodeURIComponent(id); }
   function hnApi(id) { return "https://hacker-news.firebaseio.com/v0/item/" + encodeURIComponent(id) + ".json"; }
@@ -209,10 +215,13 @@
 
   function fetchItem(id) {
     if (itemCache.has(id)) { return Promise.resolve(itemCache.get(id)); }
-    return fetch(hnApi(id))
+    if (inFlight.has(id)) { return inFlight.get(id); } // requête déjà partie : on la partage
+    var p = fetch(hnApi(id))
       .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (item) { itemCache.set(id, item); return item; })
-      .catch(function () { itemCache.set(id, null); return null; });
+      .then(function (item) { itemCache.set(id, item); inFlight.delete(id); return item; })
+      .catch(function () { itemCache.set(id, null); inFlight.delete(id); return null; });
+    inFlight.set(id, p);
+    return p;
   }
 
   function urlHost(u) {
