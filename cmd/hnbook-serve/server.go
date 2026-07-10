@@ -7,10 +7,15 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hazyhaar/horosvec"
 )
+
+// maxPreviewURLParamLen borne la longueur du paramètre url de /api/preview (anti-abus), en
+// cohérence avec previewMaxURLLen.
+const maxPreviewURLParamLen = previewMaxURLLen
 
 // maxQueryBytes borne la taille du texte de requête accepté (anti-abus). Au-delà, la requête
 // est rejetée (400) avant tout travail d'embedding ou de recherche.
@@ -39,6 +44,23 @@ type server struct {
 	// activé QUE lorsque le service est réellement placé derrière un proxy de confiance (nginx),
 	// faute de quoi l'en-tête est falsifiable et contournerait le limiteur de débit.
 	trustProxy bool
+
+	// prev porte le mandataire de prévisualisation Open Graph (client HTTP durci + cache). Il est
+	// construit paresseusement à la première prévisualisation (previewer() sous prevOnce), ce qui
+	// évite tout câblage supplémentaire au point d'assemblage du serveur.
+	prev     *previewer
+	prevOnce sync.Once
+}
+
+// previewer restitue le mandataire de prévisualisation, construit une seule fois. Un previewer
+// injecté (tests) est respecté ; sinon un previewer durci par défaut est bâti.
+func (s *server) previewer() *previewer {
+	s.prevOnce.Do(func() {
+		if s.prev == nil {
+			s.prev = newPreviewer()
+		}
+	})
+	return s.prev
 }
 
 // searchResult est une entrée de la réponse JSON de /api/search.
@@ -60,6 +82,7 @@ func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.handleIndex)
 	mux.HandleFunc("GET /api/search", s.handleSearch)
+	mux.HandleFunc("GET /api/preview", s.handlePreview)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	return mux
 }
@@ -142,6 +165,43 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("recherche", "ip", ip, "q_len", len(q), "results", len(out.Results),
 		"latency_ms", totalMS, "embed_ms", embedMS)
 	s.writeJSON(w, http.StatusOK, out)
+}
+
+// handlePreview rend un aperçu Open Graph de l'URL cible externe d'un item, que le navigateur ne
+// peut pas récupérer lui-même (CORS). Il passe par le MÊME limiteur de débit par IP que
+// /api/search. Le durcissement (anti-SSRF, bornes, non-HTML) vit dans preview.go ; ce handler
+// borne l'entrée, sert le cache, et rend TOUJOURS un JSON en 200 (champs vides + error en cas
+// d'échec) pour que le panneau se dégrade gracieusement, jamais un 500.
+func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r, s.trustProxy)
+	if !s.lim.allow(ip) {
+		s.writeError(w, http.StatusTooManyRequests, "trop de requêtes")
+		return
+	}
+
+	raw := strings.TrimSpace(r.URL.Query().Get("url"))
+	if raw == "" {
+		s.writeJSON(w, http.StatusOK, previewResult{Error: "paramètre url manquant"})
+		return
+	}
+	if len(raw) > maxPreviewURLParamLen {
+		s.writeJSON(w, http.StatusOK, previewResult{URL: raw[:64], Error: "url trop longue"})
+		return
+	}
+
+	p := s.previewer()
+	if res, ok := p.lookup(raw); ok {
+		s.writeJSON(w, http.StatusOK, res)
+		return
+	}
+
+	res := p.fetch(r.Context(), raw)
+	p.store(raw, res)
+
+	if res.Error != "" {
+		s.log.Info("prévisualisation dégradée", "ip", ip, "err", res.Error)
+	}
+	s.writeJSON(w, http.StatusOK, res)
 }
 
 func (s *server) writeJSON(w http.ResponseWriter, status int, v any) {

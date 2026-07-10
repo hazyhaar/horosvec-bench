@@ -69,6 +69,17 @@
   .detail .links a { color: var(--accent); text-decoration: none; }
   .detail .links a:hover { text-decoration: underline; }
 
+  .og {
+    margin: .2rem 0 1rem; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--panel-hi); overflow: hidden;
+  }
+  .og img { display: block; width: 100%; max-height: 200px; object-fit: cover; background: var(--panel); }
+  .og .og-body { padding: .6rem .75rem; }
+  .og .og-site { color: var(--muted); font-size: .74rem; text-transform: uppercase; letter-spacing: .03em; }
+  .og .og-title { color: var(--fg); font-size: .92rem; font-weight: 600; margin: .15rem 0 .25rem; line-height: 1.35; }
+  .og .og-desc { color: var(--muted); font-size: .82rem; line-height: 1.5; }
+  .og.loading { color: var(--muted); font-size: .8rem; padding: .55rem .75rem; }
+
   footer { margin-top: 2.25rem; color: var(--muted); font-size: .8rem; line-height: 1.7; }
   footer a { color: var(--accent); text-decoration: none; }
 
@@ -163,6 +174,81 @@
     return "item " + id;
   }
 
+  // safeExternalUrl rend l'URL cible d'un item si elle est http(s) et pointe vers un hôte
+  // externe à Hacker News (les items « Ask HN » sans url renvoient chaîne vide).
+  function safeExternalUrl(item) {
+    if (!item || !item.url) { return ""; }
+    try {
+      var u = new URL(item.url);
+      if (u.protocol !== "http:" && u.protocol !== "https:") { return ""; }
+      if (u.host === "news.ycombinator.com") { return ""; }
+      return u.href;
+    } catch (e) { return ""; }
+  }
+
+  // safeImageUrl n'accepte qu'un schéma http(s) pour une vignette distante ; javascript:, data:
+  // et tout autre schéma sont rejetés (chaîne vide). AUCUN innerHTML de donnée distante.
+  function safeImageUrl(raw) {
+    if (!raw) { return ""; }
+    try {
+      var u = new URL(raw);
+      return (u.protocol === "http:" || u.protocol === "https:") ? u.href : "";
+    } catch (e) { return ""; }
+  }
+
+  // loadPreview interroge le mandataire serveur puis remplit le bloc og. Tous les textes passent
+  // par textContent (aucune interprétation HTML) ; la vignette n'est posée sur img.src qu'après
+  // validation de schéma. Sur erreur ou champs vides, le bloc est retiré : dégradation gracieuse
+  // vers l'affichage de l'hôte seul (déjà présent dans les liens).
+  function loadPreview(og, extUrl) {
+    fetch("/api/preview?url=" + encodeURIComponent(extUrl))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; })
+      .then(function (data) {
+        // Ne rendre que si le bloc est toujours attaché (carte encore sélectionnée).
+        if (!og.isConnected) { return; }
+        if (!data || data.error || (!data.title && !data.description && !data.image)) {
+          og.remove();
+          return;
+        }
+        og.className = "og";
+        og.textContent = "";
+
+        var img = safeImageUrl(data.image);
+        if (img) {
+          var im = document.createElement("img");
+          im.src = img;              // src validé http(s) uniquement
+          im.alt = "";
+          im.loading = "lazy";
+          im.referrerPolicy = "no-referrer";
+          im.addEventListener("error", function () { im.remove(); });
+          og.appendChild(im);
+        }
+
+        var b = document.createElement("div");
+        b.className = "og-body";
+        if (data.site_name) {
+          var sn = document.createElement("div");
+          sn.className = "og-site";
+          sn.textContent = data.site_name;   // textContent : anti-XSS
+          b.appendChild(sn);
+        }
+        if (data.title) {
+          var ti = document.createElement("div");
+          ti.className = "og-title";
+          ti.textContent = data.title;       // textContent : anti-XSS
+          b.appendChild(ti);
+        }
+        if (data.description) {
+          var de = document.createElement("div");
+          de.className = "og-desc";
+          de.textContent = data.description; // textContent : anti-XSS
+          b.appendChild(de);
+        }
+        og.appendChild(b);
+      });
+  }
+
   function renderDetail(item, id) {
     detail.innerHTML = "";
     var wrap = document.createElement("div");
@@ -184,6 +270,17 @@
       sub.textContent = "Item introuvable ou supprimé (id " + id + ").";
     }
     wrap.appendChild(sub);
+
+    // Aperçu Open Graph pour un item pointant vers une page EXTERNE : le navigateur ne peut pas
+    // récupérer ces métadonnées lui-même (CORS), d'où le mandataire serveur /api/preview.
+    var extUrl = safeExternalUrl(item);
+    if (extUrl) {
+      var og = document.createElement("div");
+      og.className = "og loading";
+      og.textContent = "Chargement de l'aperçu…";
+      wrap.appendChild(og);
+      loadPreview(og, extUrl);
+    }
 
     if (item && item.text) {
       var body = document.createElement("div");
