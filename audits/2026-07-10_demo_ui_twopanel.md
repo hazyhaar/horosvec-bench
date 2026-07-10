@@ -90,3 +90,15 @@ La nouvelle page est bien embarquée via `//go:embed index.html`.
 - N2 : moteur horosvec, contrat `/api/search`, pipeline embedding intacts. OK.
 - N3 : 0 `innerHTML` de donnée distante non nettoyée. OK.
 - N4 : 0 secret. N5 : 0 push, 0 redéploiement. N6 : recherche inchangée. OK.
+
+## Auto-audit adversarial (subagent auditeur, mode secu-deep)
+
+Verdict : VERT sur tous les sinks HTML (chaque `innerHTML` porte une constante
+littérale ; toute donnée HN passe par `textContent` ; `decodeEntities` via
+textarea RCDATA jugé sûr ; item null géré ; contrat `/api/search` intact ;
+responsive présent). Un finding SOFT : `a.href = item.url` posé sans valider le
+schéma (vecteur `javascript:` conditionné à un clic, atténué par rel/target).
+
+Résolution (commit 51175c8) : le lien cible n'est posé que si le protocole est
+`http:`/`https:` (parse `new URL`, sinon href non posé) — bloque `javascript:`
+et `data:`. Rebuild + vet + test + gofmt verts, embed confirmé (detail-empty=4).
