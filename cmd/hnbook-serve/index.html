@@ -6,7 +6,7 @@
 <title>horosvec — recherche sémantique HNbook</title>
 <style>
   :root {
-    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --bg: #0d1117; --panel: #161b22; --panel-hi: #1c2330; --border: #30363d;
     --fg: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --score: #3fb950;
   }
   * { box-sizing: border-box; }
@@ -14,10 +14,14 @@
     margin: 0; background: var(--bg); color: var(--fg);
     font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
-  main { max-width: 760px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  main { max-width: 1100px; margin: 0 auto; padding: 2.25rem 1.25rem 3rem; }
   h1 { font-size: 1.5rem; font-weight: 600; margin: 0 0 .25rem; }
-  .lede { color: var(--muted); margin: 0 0 1.75rem; font-size: .95rem; }
-  form { display: flex; gap: .5rem; margin-bottom: 1rem; }
+  .lede { color: var(--muted); margin: 0 0 1.25rem; font-size: .95rem; }
+  .banner {
+    border: 1px solid var(--border); border-radius: 8px; padding: .6rem .8rem;
+    color: var(--muted); font-size: .8rem; margin-bottom: 1.25rem; background: var(--panel);
+  }
+  form { display: flex; gap: .5rem; margin-bottom: .75rem; }
   input[type=search] {
     flex: 1; padding: .7rem .9rem; font-size: 1rem; color: var(--fg);
     background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
@@ -29,22 +33,50 @@
   }
   button:disabled { opacity: .55; cursor: wait; }
   .meta { color: var(--muted); font-size: .85rem; min-height: 1.2rem; margin-bottom: 1rem; }
-  ol { list-style: none; padding: 0; margin: 0; }
-  li {
+  .meta.err { color: #f85149; }
+
+  .split { display: flex; gap: 1.25rem; align-items: flex-start; }
+  .col-left { flex: 1 1 44%; min-width: 0; }
+  .col-right {
+    flex: 1 1 56%; min-width: 0; position: sticky; top: 1rem;
     background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-    padding: .75rem .9rem; margin-bottom: .6rem;
+    padding: 1.1rem 1.2rem; min-height: 240px;
   }
-  li .title { display: block; color: var(--fg); font-size: .98rem; margin-bottom: .3rem; }
-  li a { color: var(--accent); text-decoration: none; font-size: .82rem; }
-  li a:hover { text-decoration: underline; }
-  li .score { color: var(--score); font-size: .8rem; float: right; font-variant-numeric: tabular-nums; }
-  footer { margin-top: 2.5rem; color: var(--muted); font-size: .8rem; line-height: 1.7; }
+
+  ol { list-style: none; padding: 0; margin: 0; }
+  li.card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: .7rem .85rem; margin-bottom: .55rem; cursor: pointer;
+    transition: border-color .12s, background .12s;
+  }
+  li.card:hover { border-color: var(--accent); background: var(--panel-hi); }
+  li.card.active { border-color: var(--accent); background: var(--panel-hi); }
+  li.card .head { display: flex; justify-content: space-between; gap: .6rem; align-items: baseline; }
+  li.card .title { color: var(--fg); font-size: .98rem; font-weight: 500; }
+  li.card .score { color: var(--score); font-size: .78rem; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+  li.card .preview { color: var(--muted); font-size: .82rem; margin-top: .3rem; line-height: 1.45; }
+
+  .detail-empty { color: var(--muted); font-size: .92rem; }
+  .detail h2 { font-size: 1.15rem; font-weight: 600; margin: 0 0 .5rem; line-height: 1.35; }
+  .detail .sub { color: var(--muted); font-size: .82rem; margin-bottom: .9rem; }
+  .detail .sub b { color: var(--fg); font-weight: 600; }
+  .detail .body {
+    font-size: .92rem; line-height: 1.6; color: var(--fg);
+    max-height: 340px; overflow-y: auto; word-wrap: break-word; overflow-wrap: anywhere;
+    white-space: pre-wrap; margin-bottom: 1rem;
+  }
+  .detail .links { display: flex; flex-wrap: wrap; gap: 1rem; font-size: .85rem; }
+  .detail .links a { color: var(--accent); text-decoration: none; }
+  .detail .links a:hover { text-decoration: underline; }
+
+  footer { margin-top: 2.25rem; color: var(--muted); font-size: .8rem; line-height: 1.7; }
   footer a { color: var(--accent); text-decoration: none; }
-  .banner {
-    border: 1px solid var(--border); border-radius: 8px; padding: .6rem .8rem;
-    color: var(--muted); font-size: .8rem; margin-bottom: 1.5rem; background: var(--panel);
+
+  @media (max-width: 720px) {
+    .split { flex-direction: column; }
+    .col-left, .col-right { flex: 1 1 auto; width: 100%; }
+    .col-right { position: static; }
   }
-  .err { color: #f85149; }
 </style>
 </head>
 <body>
@@ -59,12 +91,20 @@
     <button id="go" type="submit">Chercher</button>
   </form>
   <div class="meta" id="meta"></div>
-  <ol id="results"></ol>
+
+  <div class="split">
+    <div class="col-left">
+      <ol id="results"></ol>
+    </div>
+    <div class="col-right" id="detail">
+      <p class="detail-empty">Sélectionner un résultat pour l'afficher.</p>
+    </div>
+  </div>
 
   <footer>
     Démo publique du banc <a href="https://github.com/hazyhaar/horosvec-bench">horosvec-bench</a>.
     Moteur : <a href="https://github.com/hazyhaar/horosvec">horosvec</a> (index vector-less + arène fp16).
-    Chaque résultat renvoie à sa discussion d'origine sur Hacker News.
+    Contenu des items enrichi à la volée via l'API publique Hacker News.
   </footer>
 </main>
 
@@ -75,8 +115,143 @@
   var btn = document.getElementById("go");
   var meta = document.getElementById("meta");
   var results = document.getElementById("results");
+  var detail = document.getElementById("detail");
+
+  // Cache mémoire id -> item HN (ou null si supprimé/introuvable).
+  var itemCache = new Map();
 
   function hnLink(id) { return "https://news.ycombinator.com/item?id=" + encodeURIComponent(id); }
+  function hnApi(id) { return "https://hacker-news.firebaseio.com/v0/item/" + encodeURIComponent(id) + ".json"; }
+
+  // Décode les entités HTML d'une chaîne HN en TEXTE BRUT, sans jamais exécuter le balisage.
+  // On passe par un textarea : innerHTML n'exécute pas de script dans un textarea (contenu RCDATA),
+  // et on ne relit que .value (texte), qu'on réinjecte ensuite via textContent.
+  function decodeEntities(raw) {
+    if (!raw) { return ""; }
+    var ta = document.createElement("textarea");
+    ta.innerHTML = String(raw);
+    var txt = ta.value;
+    // HN emploie <p> comme séparateur de paragraphe ; on le rend en saut de ligne lisible.
+    return txt.replace(/<p>/gi, "\n\n").replace(/<\/p>/gi, "");
+  }
+
+  function fetchItem(id) {
+    if (itemCache.has(id)) { return Promise.resolve(itemCache.get(id)); }
+    return fetch(hnApi(id))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (item) { itemCache.set(id, item); return item; })
+      .catch(function () { itemCache.set(id, null); return null; });
+  }
+
+  function urlHost(u) {
+    try { return new URL(u).host; } catch (e) { return ""; }
+  }
+
+  // Aperçu textuel d'un item pour le panneau gauche.
+  function previewOf(item, id) {
+    if (!item) { return ""; }
+    if (item.text) {
+      var t = decodeEntities(item.text).trim().replace(/\s+/g, " ");
+      return t.length > 140 ? t.slice(0, 140) + "…" : t;
+    }
+    if (item.url) { return urlHost(item.url); }
+    return "";
+  }
+
+  function titleOf(item, id) {
+    if (item && item.title) { return item.title; }
+    return "item " + id;
+  }
+
+  function renderDetail(item, id) {
+    detail.innerHTML = "";
+    var wrap = document.createElement("div");
+    wrap.className = "detail";
+
+    var h2 = document.createElement("h2");
+    h2.textContent = item && item.title ? item.title : ("item " + id);
+    wrap.appendChild(h2);
+
+    var sub = document.createElement("div");
+    sub.className = "sub";
+    if (item) {
+      var parts = [];
+      if (item.by) { parts.push("par " + item.by); }
+      if (item.time) { parts.push(new Date(item.time * 1000).toLocaleString("fr-FR")); }
+      if (typeof item.score === "number") { parts.push(item.score + " points"); }
+      sub.textContent = parts.join(" · ");
+    } else {
+      sub.textContent = "Item introuvable ou supprimé (id " + id + ").";
+    }
+    wrap.appendChild(sub);
+
+    if (item && item.text) {
+      var body = document.createElement("div");
+      body.className = "body";
+      // decodeEntities rend du TEXTE BRUT ; textContent empêche toute réinterprétation HTML.
+      body.textContent = decodeEntities(item.text);
+      wrap.appendChild(body);
+    }
+
+    var links = document.createElement("div");
+    links.className = "links";
+    if (item && item.url) {
+      var au = document.createElement("a");
+      au.href = item.url; au.rel = "noopener noreferrer nofollow"; au.target = "_blank";
+      au.textContent = "Lien cible (" + (urlHost(item.url) || "url") + ")";
+      links.appendChild(au);
+    }
+    var ah = document.createElement("a");
+    ah.href = hnLink(id); ah.rel = "noopener noreferrer"; ah.target = "_blank";
+    ah.textContent = "Discussion Hacker News";
+    links.appendChild(ah);
+    wrap.appendChild(links);
+
+    detail.appendChild(wrap);
+  }
+
+  function selectCard(li, id) {
+    var prev = results.querySelector("li.card.active");
+    if (prev) { prev.classList.remove("active"); }
+    li.classList.add("active");
+    detail.innerHTML = "<p class=\"detail-empty\">Chargement…</p>";
+    fetchItem(id).then(function (item) {
+      // Ne rendre que si la carte est toujours celle sélectionnée.
+      if (li.classList.contains("active")) { renderDetail(item, id); }
+    });
+  }
+
+  function buildCard(res) {
+    var id = String(res.id);
+    var li = document.createElement("li");
+    li.className = "card";
+
+    var head = document.createElement("div");
+    head.className = "head";
+    var title = document.createElement("span");
+    title.className = "title";
+    title.textContent = "item " + id; // placeholder le temps du fetch
+    var score = document.createElement("span");
+    score.className = "score";
+    score.textContent = "d² " + Number(res.score).toFixed(3);
+    head.appendChild(title);
+    head.appendChild(score);
+    li.appendChild(head);
+
+    var preview = document.createElement("div");
+    preview.className = "preview";
+    li.appendChild(preview);
+
+    li.addEventListener("click", function () { selectCard(li, id); });
+    results.appendChild(li);
+
+    // Enrichissement asynchrone : titre + aperçu réels.
+    fetchItem(id).then(function (item) {
+      title.textContent = titleOf(item, id); // textContent : aucune injection possible
+      preview.textContent = previewOf(item, id);
+    });
+    return li;
+  }
 
   form.addEventListener("submit", function (ev) {
     ev.preventDefault();
@@ -86,6 +261,7 @@
     meta.className = "meta";
     meta.textContent = "Recherche en cours…";
     results.innerHTML = "";
+    detail.innerHTML = "<p class=\"detail-empty\">Sélectionner un résultat pour l'afficher.</p>";
 
     fetch("/api/search?q=" + encodeURIComponent(q))
       .then(function (r) {
@@ -95,29 +271,12 @@
         return r.json();
       })
       .then(function (data) {
-        var n = (data.results || []).length;
+        var list = data.results || [];
+        var n = list.length;
         meta.textContent = n + " résultats · " + data.latency_ms.toFixed(1)
           + " ms (dont embedding " + data.embed_ms.toFixed(1) + " ms)";
-        (data.results || []).forEach(function (it) {
-          var li = document.createElement("li");
-          var score = document.createElement("span");
-          score.className = "score";
-          score.textContent = "d² " + Number(it.score).toFixed(3);
-          li.appendChild(score);
-          var title = document.createElement("span");
-          title.className = "title";
-          // textContent : échappement natif, aucune injection possible.
-          title.textContent = it.title_snippet ? it.title_snippet : ("item " + it.id);
-          li.appendChild(title);
-          var a = document.createElement("a");
-          a.href = hnLink(it.id);
-          a.rel = "noopener noreferrer";
-          a.target = "_blank";
-          a.textContent = hnLink(it.id);
-          li.appendChild(a);
-          results.appendChild(li);
-        });
-        if (n === 0) { meta.textContent = "Aucun résultat."; }
+        if (n === 0) { meta.textContent = "Aucun résultat."; return; }
+        list.forEach(function (res) { buildCard(res); });
       })
       .catch(function (e) {
         meta.className = "meta err";
