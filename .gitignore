@@ -7,3 +7,5 @@ third_party/hnswgo_build/
 hnbook-import
 hnbook-build
 hnbook-validate
+/hnbook-serve
+/data/
