@@ -21,3 +21,8 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+// Le banc mesure TOUJOURS le moteur local en cours de développement, jamais une
+// version publiée : le replace en chemin absolu est assumé (harnais mono-poste ;
+// adapter le chemin si le workspace change de racine).
+replace github.com/hazyhaar/horosvec => /devhoros/horosvec
