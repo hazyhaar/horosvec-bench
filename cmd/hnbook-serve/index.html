@@ -83,6 +83,18 @@
   li.card .date { color: var(--muted); font-size: .76rem; font-variant-numeric: tabular-nums; }
   li.card .preview { color: var(--muted); font-size: .82rem; margin-top: .3rem; line-height: 1.45; }
 
+  li.thread { cursor: default; }
+  li.thread .story-head { cursor: pointer; }
+  li.thread .story-title a { color: var(--fg); text-decoration: none; font-weight: 500; }
+  li.thread .story-title a:hover { color: var(--accent); text-decoration: underline; }
+  .hit-list { margin: .5rem 0 0; padding: 0; list-style: none; }
+  .hit-list li { margin: .22rem 0; font-size: .84rem; line-height: 1.45; }
+  .hit-list a { color: var(--accent); text-decoration: none; }
+  .hit-list a:hover { text-decoration: underline; }
+  .hit-snippet { color: var(--muted); }
+  .hit-gap { color: var(--muted); font-size: .78rem; margin: .12rem 0; font-style: italic; }
+  .freshness { color: var(--muted); font-size: .8rem; margin-bottom: .35rem; }
+
   .detail-empty { color: var(--muted); font-size: .92rem; }
   .detail h2 { font-size: 1.15rem; font-weight: 600; margin: 0 0 .5rem; line-height: 1.35; }
   .detail .sub { color: var(--muted); font-size: .82rem; margin-bottom: .9rem; }
@@ -121,7 +133,7 @@
 <main>
   <h1>horosvec — semantic search</h1>
   <p class="lede">Approximate vector search over the Hacker News corpus, served without a GPU.</p>
-  <div class="banner">Hacker News corpus · 2006 → October 2021 · 26.7M items · horosvec v0.7.0 index · CPU-only</div>
+  <div class="banner">Hacker News corpus · 2006 → live (federated: monolith + delta shard) · horosvec v0.7.0 · CPU-only</div>
 
   <form id="f">
     <input id="q" type="search" name="q" placeholder="Describe a topic, an idea, a question…"
@@ -129,6 +141,7 @@
     <button id="go" type="submit">Search</button>
   </form>
   <div class="meta" id="meta"></div>
+  <div class="freshness" id="freshness" hidden></div>
 
   <div class="split">
     <div class="col-left">
@@ -158,7 +171,7 @@
   <footer>
     Public demo of the <a href="https://github.com/hazyhaar/horosvec-bench">horosvec-bench</a> benchmark.
     Engine: <a href="https://github.com/hazyhaar/horosvec">horosvec</a> (vector-less index + fp16 arena).
-    Item content is enriched on the fly via the public Hacker News API.
+    List titles and comment text come from the local index store.
   </footer>
 </main>
 
@@ -168,6 +181,7 @@
   var input = document.getElementById("q");
   var btn = document.getElementById("go");
   var meta = document.getElementById("meta");
+  var freshnessEl = document.getElementById("freshness");
   var results = document.getElementById("results");
   var detail = document.getElementById("detail");
   var listbar = document.getElementById("listbar");
@@ -178,28 +192,19 @@
   var nextBtn = document.getElementById("next");
   var pageInd = document.getElementById("pageInd");
 
-  // Nombre de voisins demandés au serveur (borné à 100 côté serveur), taille d'une page affichée.
-  var REQUEST_K = 60;
   var PAGE_SIZE = 10;
+  var INDENT_PX = 18;
+  var DEPTH_CAP = 6;
 
-  // État de la vue courante : l'ensemble des résultats retournés par le serveur (ordre pertinence
-  // d'origine préservé), le tri actif et la page affichée. La pagination et le tri sont ENTIÈREMENT
-  // côté navigateur sur cet ensemble déjà récupéré ; le serveur n'est plus resollicité.
-  var allResults = [];   // [{id, score}] dans l'ordre pertinence rendu par le serveur
+  var allThreads = [];
   var currentSort = "relevance";
   var currentPage = 0;
 
-  // Cache mémoire id -> item HN (ou null si supprimé/introuvable).
+  // Cache mémoire id -> item magasin pour le panneau de détail au clic uniquement.
   var itemCache = new Map();
-  // Requêtes en vol id -> Promise, pour DÉ-DUPLIQUER les fetch concurrents du même item : le cache
-  // n'est peuplé qu'à la résolution, donc sans ce registre deux appels simultanés (une carte rendue
-  // ET le pool de préchargement) déclencheraient deux requêtes réseau pour le même id. Le registre
-  // garantit qu'un id n'est demandé au réseau qu'une seule fois à la fois — la borne du pool porte
-  // alors sur des requêtes réellement distinctes.
   var inFlight = new Map();
 
   function hnLink(id) { return "https://news.ycombinator.com/item?id=" + encodeURIComponent(id); }
-  function hnApi(id) { return "https://hacker-news.firebaseio.com/v0/item/" + encodeURIComponent(id) + ".json"; }
 
   // Décode les entités HTML d'une chaîne HN en TEXTE BRUT, sans jamais exécuter le balisage.
   // On passe par un textarea : innerHTML n'exécute pas de script dans un textarea (contenu RCDATA),
@@ -216,7 +221,7 @@
   function fetchItem(id) {
     if (itemCache.has(id)) { return Promise.resolve(itemCache.get(id)); }
     if (inFlight.has(id)) { return inFlight.get(id); } // requête déjà partie : on la partage
-    var p = fetch(hnApi(id))
+    var p = fetch("/api/item?id=" + encodeURIComponent(id))
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (item) { itemCache.set(id, item); inFlight.delete(id); return item; })
       .catch(function () { itemCache.set(id, null); inFlight.delete(id); return null; });
@@ -228,59 +233,14 @@
     try { return new URL(u).host; } catch (e) { return ""; }
   }
 
-  // Aperçu textuel d'un item pour le panneau gauche.
-  function previewOf(item, id) {
-    if (!item) { return ""; }
-    if (item.text) {
-      var t = decodeEntities(item.text).trim().replace(/\s+/g, " ");
-      return t.length > 140 ? t.slice(0, 140) + "…" : t;
-    }
-    if (item.url) { return urlHost(item.url); }
-    return "";
-  }
-
-  function titleOf(item, id) {
-    if (item && item.title) { return item.title; }
-    return "item " + id;
-  }
-
-  // itemTime rend l'epoch (secondes) d'un item, ou null si absent/supprimé — clé du tri par date.
-  function itemTime(item) {
-    return (item && typeof item.time === "number") ? item.time : null;
-  }
-
-  // dateOf renders a short readable date ("3 Oct 2021") from the item epoch, or "" if absent.
-  var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  function dateOf(item) {
-    var t = itemTime(item);
-    if (t === null) { return ""; }
-    var d = new Date(t * 1000);
-    return d.getDate() + " " + MONTHS[d.getMonth()] + " " + d.getFullYear();
-  }
-
-  // prefetchItems précharge les items d'une liste d'ids en concurrence BORNÉE (pool de POOL en
-  // vol au plus), pour que le tri par date dispose des dates sans marteler l'API HN de 60 fetch
-  // simultanés. Les ids déjà en cache ne repartent pas. Retourne une promesse résolue quand tout
-  // est chargé. onEach est appelé après chaque item résolu (permet de re-trier au fil de l'eau).
-  var POOL = 8;
-  function prefetchItems(ids, onEach) {
-    var queue = ids.slice();
-    return new Promise(function (resolve) {
-      var inFlight = 0, done = 0, total = queue.length;
-      if (total === 0) { resolve(); return; }
-      function pump() {
-        while (inFlight < POOL && queue.length > 0) {
-          var id = queue.shift();
-          inFlight++;
-          fetchItem(id).then(function () {
-            inFlight--; done++;
-            if (onEach) { onEach(); }
-            if (done === total) { resolve(); } else { pump(); }
-          });
-        }
-      }
-      pump();
-    });
+  function parseThreadDate(dateStr) {
+    if (!dateStr) { return null; }
+    var m = /^(\d{1,2}) (\w{3}) (\d{4})$/.exec(dateStr.trim());
+    if (!m) { return null; }
+    var months = {Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};
+    var mon = months[m[2]];
+    if (mon === undefined) { return null; }
+    return new Date(Date.UTC(+m[3], mon, +m[1])).getTime();
   }
 
   // safeExternalUrl rend l'URL cible d'un item si elle est http(s) et pointe vers un hôte
@@ -371,25 +331,13 @@
     sub.className = "sub";
     if (item) {
       var parts = [];
-      if (item.by) { parts.push("by " + item.by); }
-      if (item.time) { parts.push(new Date(item.time * 1000).toLocaleString("en-US")); }
-      if (typeof item.score === "number") { parts.push(item.score + " points"); }
+      if (item.date) { parts.push(item.date); }
+      if (item.type) { parts.push(item.type); }
       sub.textContent = parts.join(" · ");
     } else {
       sub.textContent = "Item not found or deleted (id " + id + ").";
     }
     wrap.appendChild(sub);
-
-    // Aperçu Open Graph pour un item pointant vers une page EXTERNE : le navigateur ne peut pas
-    // récupérer ces métadonnées lui-même (CORS), d'où le mandataire serveur /api/preview.
-    var extUrl = safeExternalUrl(item);
-    if (extUrl) {
-      var og = document.createElement("div");
-      og.className = "og loading";
-      og.textContent = "Loading preview…";
-      wrap.appendChild(og);
-      loadPreview(og, extUrl);
-    }
 
     if (item && item.text) {
       var body = document.createElement("div");
@@ -401,20 +349,6 @@
 
     var links = document.createElement("div");
     links.className = "links";
-    // On ne pose l'href tiers que pour un schéma http(s) — bloque javascript:/data:.
-    var safeUrl = "";
-    if (item && item.url) {
-      try {
-        var pu = new URL(item.url);
-        if (pu.protocol === "http:" || pu.protocol === "https:") { safeUrl = pu.href; }
-      } catch (e) { safeUrl = ""; }
-    }
-    if (safeUrl) {
-      var au = document.createElement("a");
-      au.href = safeUrl; au.rel = "noopener noreferrer nofollow"; au.target = "_blank";
-      au.textContent = "Target link (" + (urlHost(safeUrl) || "url") + ")";
-      links.appendChild(au);
-    }
     var ah = document.createElement("a");
     ah.href = hnLink(id); ah.rel = "noopener noreferrer"; ah.target = "_blank";
     ah.textContent = "Hacker News discussion";
@@ -435,57 +369,88 @@
     });
   }
 
-  function buildCard(res) {
-    var id = String(res.id);
+  function buildThreadCard(thread) {
+    var root = thread.root || {};
+    var rootId = String(root.id || "");
     var li = document.createElement("li");
-    li.className = "card";
+    li.className = "card thread";
 
     var head = document.createElement("div");
-    head.className = "head";
-    var title = document.createElement("span");
-    title.className = "title";
-    title.textContent = "item " + id; // placeholder le temps du fetch
+    head.className = "head story-head";
+    var titleWrap = document.createElement("span");
+    titleWrap.className = "story-title";
+    var titleLink = document.createElement("a");
+    titleLink.href = root.url || hnLink(rootId);
+    titleLink.target = "_blank";
+    titleLink.rel = "noopener noreferrer";
+    titleLink.textContent = root.title || ("item " + rootId);
+    titleWrap.appendChild(titleLink);
     var metaRight = document.createElement("div");
     metaRight.className = "meta-right";
     var date = document.createElement("span");
     date.className = "date";
+    date.textContent = root.date || "";
     var score = document.createElement("span");
     score.className = "score";
-    score.textContent = "d² " + Number(res.score).toFixed(3);
+    score.textContent = "score " + Number(thread.score).toFixed(3);
     metaRight.appendChild(date);
     metaRight.appendChild(score);
-    head.appendChild(title);
+    head.appendChild(titleWrap);
     head.appendChild(metaRight);
     li.appendChild(head);
 
-    var preview = document.createElement("div");
-    preview.className = "preview";
-    li.appendChild(preview);
-
-    li.addEventListener("click", function () { selectCard(li, id); });
-    results.appendChild(li);
-
-    // Enrichissement asynchrone : titre + date + aperçu réels. La date est déjà connue si
-    // l'item a été préchargé par le pool ; sinon le fetch (mémoïsé) la fournit.
-    fetchItem(id).then(function (item) {
-      title.textContent = titleOf(item, id); // textContent : aucune injection possible
-      date.textContent = dateOf(item);       // textContent : anti-XSS
-      preview.textContent = previewOf(item, id);
+    head.addEventListener("click", function (ev) {
+      if (ev.target && ev.target.tagName === "A") { return; }
+      selectCard(li, rootId);
     });
+
+    var hits = thread.hits || [];
+    if (hits.length > 0) {
+      var hitList = document.createElement("ul");
+      hitList.className = "hit-list";
+      var prevDepth = null;
+      hits.forEach(function (hit) {
+        if (prevDepth !== null && hit.depth > prevDepth + 1) {
+          var gap = document.createElement("li");
+          gap.className = "hit-gap";
+          gap.textContent = "[...]";
+          gap.style.marginLeft = (Math.min(hit.depth, DEPTH_CAP) * INDENT_PX) + "px";
+          hitList.appendChild(gap);
+        }
+        var hli = document.createElement("li");
+        hli.style.marginLeft = (Math.min(hit.depth, DEPTH_CAP) * INDENT_PX) + "px";
+        var link = document.createElement("a");
+        link.href = hit.url || hnLink(hit.id);
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = hit.text_snippet || hit.title_snippet || ("comment " + hit.id);
+        hli.appendChild(link);
+        var d2 = document.createElement("span");
+        d2.className = "hit-snippet";
+        d2.textContent = " · d² " + Number(hit.d2).toFixed(3);
+        hli.appendChild(d2);
+        hli.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          selectCard(li, String(hit.id));
+        });
+        hitList.appendChild(hli);
+        prevDepth = hit.depth;
+      });
+      li.appendChild(hitList);
+    }
+
+    results.appendChild(li);
     return li;
   }
 
-  // sortedResults rend une COPIE de allResults ordonnée selon le tri actif. Le tri par date
-  // s'appuie sur les items en cache (préchargés) ; les items sans date connue (supprimés, nuls,
-  // ou pas encore chargés) sont poussés en fin. Le tri « pertinence » restitue l'ordre serveur.
-  function sortedResults() {
-    if (currentSort === "relevance") { return allResults.slice(); }
+  function sortedThreads() {
+    if (currentSort === "relevance") { return allThreads.slice(); }
     var recent = currentSort === "recent";
-    return allResults.slice().sort(function (a, b) {
-      var ta = itemTime(itemCache.get(String(a.id)));
-      var tb = itemTime(itemCache.get(String(b.id)));
+    return allThreads.slice().sort(function (a, b) {
+      var ta = parseThreadDate((a.root && a.root.date) || "");
+      var tb = parseThreadDate((b.root && b.root.date) || "");
       if (ta === null && tb === null) { return 0; }
-      if (ta === null) { return 1; }   // sans date -> fin
+      if (ta === null) { return 1; }
       if (tb === null) { return -1; }
       return recent ? (tb - ta) : (ta - tb);
     });
@@ -494,7 +459,7 @@
   // renderPage rend la tranche PAGE_SIZE de la page courante, en tenant compte du tri actif, et
   // met à jour l'indicateur de page et l'état des boutons.
   function renderPage() {
-    var ordered = sortedResults();
+    var ordered = sortedThreads();
     var total = ordered.length;
     var pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
     if (currentPage >= pages) { currentPage = pages - 1; }
@@ -503,10 +468,10 @@
     results.innerHTML = "";
     var start = currentPage * PAGE_SIZE;
     var slice = ordered.slice(start, start + PAGE_SIZE);
-    slice.forEach(function (res) { buildCard(res); });
+    slice.forEach(function (th) { buildThreadCard(th); });
 
     pageInd.textContent = "Page " + (currentPage + 1) + " of " + pages
-      + " · " + total + " results";
+      + " · " + total + " threads";
     prevBtn.disabled = currentPage === 0;
     nextBtn.disabled = currentPage >= pages - 1;
     pager.hidden = total <= PAGE_SIZE;
@@ -534,11 +499,12 @@
     results.innerHTML = "";
     listbar.hidden = true;
     pager.hidden = true;
-    allResults = [];
+    allThreads = [];
     currentPage = 0;
+    freshnessEl.hidden = true;
     detail.innerHTML = "<p class=\"detail-empty\">Select a result to view it.</p>";
 
-    fetch("/api/search?q=" + encodeURIComponent(q) + "&k=" + REQUEST_K)
+    fetch("/api/search?q=" + encodeURIComponent(q))
       .then(function (r) {
         if (r.status === 429) { throw new Error("Too many requests — please wait a moment."); }
         if (r.status === 503) { throw new Error("Embedding service unavailable."); }
@@ -546,34 +512,23 @@
         return r.json();
       })
       .then(function (data) {
-        var list = data.results || [];
+        var list = data.threads || [];
         var n = list.length;
-        meta.textContent = n + " results · " + data.latency_ms.toFixed(1)
+        meta.textContent = n + " threads · " + data.latency_ms.toFixed(1)
           + " ms (embedding " + data.embed_ms.toFixed(1) + " ms)";
+        if (data.freshness) {
+          freshnessEl.textContent = "dernier item connu : " + data.freshness +
+            (data.indices && data.indices.length ? " · indices : " + data.indices.join(", ") : "");
+          freshnessEl.hidden = false;
+        }
         if (n === 0) { meta.textContent = "No results."; return; }
 
-        allResults = list.map(function (res) { return { id: res.id, score: res.score }; });
-        // Honest label: sorting applies to the N relevant results retrieved, never to the
-        // whole corpus of 26.7M items.
-        sortNote.textContent = "Sorting the " + n + " relevant results retrieved (not the whole corpus).";
+        allThreads = list;
+        sortNote.textContent = "Sorting the " + n + " threads retrieved (not the whole corpus).";
         listbar.hidden = false;
         currentSort = "relevance";
         sortSel.value = "relevance";
-
-        // Peuple la page courante en priorité (ses ids), puis complète le reste en fond pour
-        // que le tri par date dispose de toutes les dates. Concurrence bornée (pool).
-        var allIds = allResults.map(function (r2) { return String(r2.id); });
-        var firstIds = allIds.slice(0, PAGE_SIZE);
-        var restIds = allIds.slice(PAGE_SIZE);
         renderPage();
-        prefetchItems(firstIds, null).then(function () {
-          // Recharge la page visible (dates fraîchement connues) sans re-fetch (cache mémoïsé).
-          if (currentSort !== "relevance") { renderPage(); }
-          prefetchItems(restIds, null).then(function () {
-            // Toutes les dates sont connues : rafraîchit la page si un tri par date est actif.
-            if (currentSort !== "relevance") { renderPage(); }
-          });
-        });
       })
       .catch(function (e) {
         meta.className = "meta err";

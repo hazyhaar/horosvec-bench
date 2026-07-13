@@ -1,0 +1,20 @@
+[Unit]
+Description=HackerNews delta fetch (head + backfill) for horosvec POC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/devhoros/horosvec-bench/bin/hnbook-fetch \
+  -once \
+  -cursors /var/lib/hnbook/cursors.db \
+  -store /var/lib/hnbook/titles.db \
+  -shard /var/lib/hnbook/shard-current.db \
+  -titles-bin /devhoros/horosvec-bench/bin/hnbook-titles \
+  -embed-url http://127.0.0.1:8471/embed \
+  -backfill-budget 500
+
+[Install]
+WantedBy=multi-user.target

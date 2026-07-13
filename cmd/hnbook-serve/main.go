@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -52,22 +53,39 @@ func main() {
 	indexPath := flag.String("index", "", "index SQLite vector-less (adossé à l'arène, lecture seule)")
 	arenaPath := flag.String("arena", "", "arène fp16 HVARENA1 (lecture seule)")
 	idsPath := flag.String("ids", "", "fichier d'ids optionnel (uint64 LE ; non requis, Search rend l'ext_id)")
-	titlesPath := flag.String("titles", "", "fichier optionnel de titres id<TAB>titre (chargé en map si présent)")
+	titlesPath := flag.String("titles", "", "magasin SQLite arborescent (lecture seule, modernc)")
 	embedURL := flag.String("embed-url", "http://127.0.0.1:8471/embed", "endpoint HTTP du sidecar d'embedding")
 	addr := flag.String("addr", "127.0.0.1:8472", "adresse d'écoute du serveur HTTP")
-	topK := flag.Int("topk", 10, "nombre de voisins rendus par requête")
+	topK := flag.Int("topk", 10, "nombre de fils affichés par page (UI)")
+	kRaw := flag.Int("k-raw", 300, "nombre de hits bruts tirés avant regroupement par fil")
+	tau := flag.Float64("tau", 0.1, "paramètre tau du score log-somme-exp par fil")
+	shardPath := flag.String("shard", "", "shard courant horosvec db-blob (lecture seule, optionnel)")
+	shardsDir := flag.String("shards-dir", "", "répertoire d'arènes mensuelles publiées (optionnel, balayé)")
+	reloadInterval := flag.Duration("reload-interval", 5*time.Minute, "intervalle de rechargement du shard et shards-dir (0 = désactivé)")
 	trustProxy := flag.Bool("trust-proxy", false, "lire X-Forwarded-For (à n'activer QUE derrière un proxy de confiance, ex. nginx)")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	if *indexPath == "" || *arenaPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: hnbook-serve -index <db> -arena <path> [-ids <path>] [-titles <path>] [-embed-url <url>] [-addr <hostport>] [-topk N]")
+	if *indexPath == "" || *arenaPath == "" || *titlesPath == "" {
+		fmt.Fprintln(os.Stderr, "usage: hnbook-serve -index <db> -arena <path> -titles <store.db> [-shard <db-blob>] [-shards-dir <dir>] [-reload-interval D] [-ids <path>] [-embed-url <url>] [-addr <hostport>] [-topk N] [-k-raw N] [-tau F]")
+		os.Exit(2)
+	}
+	if *reloadInterval < 0 {
+		fmt.Fprintln(os.Stderr, "hnbook-serve: -reload-interval ne peut pas être négatif")
 		os.Exit(2)
 	}
 	_ = *idsPath // Exposé pour symétrie documentaire avec hnbook-validate ; Search restitue déjà l'ext_id HN.
 	if *topK <= 0 {
 		fmt.Fprintln(os.Stderr, "hnbook-serve: -topk doit être strictement positif")
+		os.Exit(2)
+	}
+	if *kRaw <= 0 {
+		fmt.Fprintln(os.Stderr, "hnbook-serve: -k-raw doit être strictement positif")
+		os.Exit(2)
+	}
+	if *tau <= 0 {
+		fmt.Fprintln(os.Stderr, "hnbook-serve: -tau doit être strictement positif")
 		os.Exit(2)
 	}
 
@@ -77,25 +95,27 @@ func main() {
 	warnIfRotational(log, "arène", *arenaPath)
 	warnIfRotational(log, "index", *indexPath)
 
-	// Les titres sont un simple chargement de fichier (rapide) et n'entrent pas dans la fenêtre
-	// coûteuse de ~90 s : ils restent synchrones, avant la liaison du port.
-	titles, err := loadTitles(*titlesPath)
+	warnIfRotational(log, "titles", *titlesPath)
+	if *shardPath != "" {
+		warnIfRotational(log, "shard", *shardPath)
+	}
+
+	store, err := openTitleStore(*titlesPath)
 	if err != nil {
-		log.Error("chargement titres", "path", *titlesPath, "err", err.Error())
+		log.Error("ouverture magasin titres", "path", *titlesPath, "err", err.Error())
 		os.Exit(1)
 	}
-	if *titlesPath == "" {
-		log.Info("aucun fichier de titres : la page affiche l'id HN et son lien")
-	} else {
-		log.Info("titres chargés", "n", len(titles))
-	}
+	defer store.Close()
+	log.Info("magasin titres ouvert", "path", *titlesPath, "freshness_ts", store.FreshnessTS())
 
 	srv := &server{
 		embed:      &embedClient{url: *embedURL, hc: &http.Client{Timeout: 10 * time.Second}},
-		titles:     titles,
+		store:      store,
 		lim:        newIPLimiter(ctx, 1.0, 5.0),
 		reqTimeout: 10 * time.Second,
 		topK:       *topK,
+		kRaw:       *kRaw,
+		tau:        *tau,
 		html:       indexHTML,
 		warming:    warmingHTML,
 		log:        log,
@@ -122,6 +142,8 @@ func main() {
 	// pendant ce temps. Succès -> publication atomique de l'index (bascule à « prêt »). Échec ->
 	// état d'erreur fail-loud, puis sortie non-zéro après un délai de grâce (jamais de
 	// préchauffage éternel silencieux).
+	var monolithIdx atomic.Pointer[horosvec.Index]
+	var reloadClosers atomic.Pointer[[]func()]
 	go func() {
 		defer func() {
 			if p := recover(); p != nil {
@@ -130,7 +152,7 @@ func main() {
 				srv.loadErr.Store(&msg)
 			}
 		}()
-		idx, dbCloser, err := openIndex(*indexPath, *arenaPath)
+		bundle, err := buildFederatedIndex(log, *indexPath, *arenaPath, *shardPath, *shardsDir, openIndex)
 		if err != nil {
 			log.Error("chargement de l'index échoué (fail-loud)", "err", err.Error())
 			msg := "chargement de l'index impossible"
@@ -139,11 +161,55 @@ func main() {
 			log.Error("arrêt du process après échec de chargement de l'index", "grace", loadErrorGrace.String())
 			os.Exit(1)
 		}
-		closeIdx := func() { _ = idx.Close(); dbCloser() }
-		srv.onClose.Store(&closeIdx)
-		srv.setIndex(idx)
-		log.Info("index chargé, recherche disponible", "index", *indexPath, "arena", *arenaPath)
+		monolithIdx.Store(bundle.monolith)
+		reloadClosers.Store(&bundle.reloadClosers)
+		closeAll := func() {
+			if c := reloadClosers.Load(); c != nil {
+				for _, fn := range *c {
+					fn()
+				}
+			}
+			bundle.monolithClose()
+		}
+		srv.onClose.Store(&closeAll)
+		srv.setIndex(bundle.searcher)
+		log.Info("index fédéré chargé, recherche disponible",
+			"n_indices", len(bundle.labels), "indices", bundle.labels,
+			"monolith", *indexPath, "arena", *arenaPath,
+			"shard", *shardPath, "shards_dir", *shardsDir)
 	}()
+
+	if *reloadInterval > 0 && (*shardPath != "" || *shardsDir != "") {
+		go func() {
+			ticker := time.NewTicker(*reloadInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					mono := monolithIdx.Load()
+					if mono == nil {
+						continue
+					}
+					if prev := reloadClosers.Load(); prev != nil {
+						for _, fn := range *prev {
+							fn()
+						}
+					}
+					fed, closers, labels := rebuildReloadable(log, mono, *shardPath, *shardsDir)
+					reloadClosers.Store(&closers)
+					srv.setIndex(fed)
+					refreshCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					if err := store.refreshFreshness(refreshCtx); err != nil {
+						log.Warn("freshness refresh périodique échouée", "err", err.Error())
+					}
+					cancel()
+					log.Info("index fédéré rechargé", "n_indices", len(labels), "indices", labels)
+				}
+			}
+		}()
+	}
 
 	go func() {
 		defer func() {
@@ -158,7 +224,9 @@ func main() {
 	}()
 
 	log.Info("hnbook-serve à l'écoute (préchauffage de l'index en cours)", "addr", *addr,
-		"index", *indexPath, "arena", *arenaPath, "embed_url", *embedURL, "topk", *topK)
+		"index", *indexPath, "arena", *arenaPath, "titles", *titlesPath,
+		"shard", *shardPath, "shards_dir", *shardsDir, "reload_interval", reloadInterval.String(),
+		"embed_url", *embedURL, "topk", *topK, "k_raw", *kRaw, "tau", *tau)
 	if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		log.Error("serveur HTTP", "err", err.Error())
 		os.Exit(1)

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +56,12 @@ type searcher interface {
 	Search(ctx context.Context, query []float32, topK int) ([]horosvec.Result, error)
 }
 
+// searchMeta expose les labels d'index interrogés/sautés (federatedSearcher).
+type searchMeta interface {
+	LastIndices() []string
+	LastSkipped() []string
+}
+
 // server porte l'état immuable du service de démo (index en lecture seule, client d'embedding,
 // table de titres optionnelle, limiteur de débit, page embarquée). Aucun état mutable de
 // requête n'y est conservé : le service est sans état, seul le limiteur mute (sous son mutex).
@@ -72,10 +80,12 @@ type server struct {
 	// warming est la page servie sur GET / tant que l'index n'est pas prêt (auto-rafraîchie).
 	warming    []byte
 	embed      *embedClient
-	titles     map[string]string
+	store      *titleStore
 	lim        *ipLimiter
 	reqTimeout time.Duration
 	topK       int
+	kRaw       int
+	tau        float64
 	html       []byte
 	log        *slog.Logger
 	// trustProxy autorise la lecture de X-Forwarded-For pour identifier l'appelant. Il n'est
@@ -117,16 +127,47 @@ func (s *server) previewer() *previewer {
 	return s.prev
 }
 
-// searchResult est une entrée de la réponse JSON de /api/search.
-type searchResult struct {
+// threadRoot est l'en-tête story d'un fil dans la réponse JSON de /api/search.
+type threadRoot struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Date  string `json:"date"`
+	URL   string `json:"url"`
+}
+
+// threadHit est un commentaire (ou item) matché dans un fil.
+type threadHit struct {
 	ID           string  `json:"id"`
-	Score        float64 `json:"score"`
+	Depth        int     `json:"depth"`
 	TitleSnippet string  `json:"title_snippet,omitempty"`
+	TextSnippet  string  `json:"text_snippet,omitempty"`
+	D2           float64 `json:"d2"`
+	URL          string  `json:"url"`
+}
+
+// itemResponse est le corps JSON rendu par GET /api/item.
+type itemResponse struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Text  string `json:"text,omitempty"`
+	Type  string `json:"type"`
+	Date  string `json:"date"`
+	URL   string `json:"url"`
+}
+
+// threadResult regroupe les hits d'un fil classé par score log-somme-exp.
+type threadResult struct {
+	Root  threadRoot  `json:"root"`
+	Score float64     `json:"score"`
+	Hits  []threadHit `json:"hits"`
 }
 
 // searchResponse est le corps JSON rendu par /api/search.
 type searchResponse struct {
-	Results   []searchResult `json:"results"`
+	Threads   []threadResult `json:"threads"`
+	Freshness string         `json:"freshness"`
+	Indices   []string       `json:"indices,omitempty"`
+	Skipped   []string       `json:"skipped,omitempty"`
 	LatencyMS float64        `json:"latency_ms"`
 	EmbedMS   float64        `json:"embed_ms"`
 }
@@ -136,6 +177,7 @@ func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.handleIndex)
 	mux.HandleFunc("GET /api/search", s.handleSearch)
+	mux.HandleFunc("GET /api/item", s.handleItem)
 	mux.HandleFunc("GET /api/preview", s.handlePreview)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	return mux
@@ -247,10 +289,17 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	topK := parseTopK(r.URL.Query().Get("k"), s.topK)
+	kRaw := s.kRaw
+	if kRaw <= 0 {
+		kRaw = 300
+	}
+	tau := s.tau
+	if tau <= 0 {
+		tau = 0.1
+	}
 
 	tSearch := time.Now()
-	res, err := idx.Search(ctx, vec, topK)
+	res, err := idx.Search(ctx, vec, kRaw)
 	if err != nil {
 		s.log.Error("search failed", "ip", ip, "err", err.Error())
 		s.writeError(w, http.StatusInternalServerError, "search unavailable")
@@ -258,25 +307,210 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	totalMS := embedMS + float64(time.Since(tSearch).Microseconds())/1000.0
 
+	if s.store == nil {
+		s.writeError(w, http.StatusServiceUnavailable, "title store unavailable")
+		return
+	}
+
+	threads, err := s.buildThreads(ctx, res, tau)
+	if err != nil {
+		s.log.Error("thread build failed", "ip", ip, "err", err.Error())
+		s.writeError(w, http.StatusInternalServerError, "search unavailable")
+		return
+	}
+
+	if err := s.store.refreshFreshness(ctx); err != nil {
+		s.log.Warn("freshness refresh failed", "ip", ip, "err", err.Error())
+	}
+
+	var indices, skipped []string
+	if meta, ok := idx.(searchMeta); ok {
+		indices = meta.LastIndices()
+		skipped = meta.LastSkipped()
+	}
+
 	out := searchResponse{
-		Results:   make([]searchResult, 0, len(res)),
+		Threads:   threads,
+		Freshness: formatHNDate(s.store.FreshnessTS()),
+		Indices:   indices,
+		Skipped:   skipped,
 		LatencyMS: totalMS,
 		EmbedMS:   embedMS,
 	}
-	for _, rr := range res {
-		id := string(rr.ID)
-		sr := searchResult{ID: id, Score: rr.Score}
-		if s.titles != nil {
-			if t, ok := s.titles[id]; ok {
-				sr.TitleSnippet = t
-			}
-		}
-		out.Results = append(out.Results, sr)
-	}
 
-	s.log.Info("search", "ip", ip, "q_len", len(q), "results", len(out.Results),
+	s.log.Info("search", "ip", ip, "q_len", len(q), "threads", len(out.Threads),
 		"latency_ms", totalMS, "embed_ms", embedMS)
 	s.writeJSON(w, http.StatusOK, out)
+}
+
+type groupedHit struct {
+	id   int64
+	d2   float64
+	item storeItem
+}
+
+// buildThreads regroupe les hits bruts par root_id, joint les titres racine, et classe.
+func (s *server) buildThreads(ctx context.Context, res []horosvec.Result, tau float64) ([]threadResult, error) {
+	if len(res) == 0 {
+		return nil, nil
+	}
+
+	ids := make([]int64, 0, len(res))
+	d2ByID := make(map[int64]float64, len(res))
+	for _, rr := range res {
+		id, ok := parseHitID(rr.ID)
+		if !ok {
+			continue
+		}
+		ids = append(ids, id)
+		d2ByID[id] = rr.Score
+	}
+	items, err := s.store.fetchItemsByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	type threadAcc struct {
+		rootID int64
+		hits   []groupedHit
+	}
+	byRoot := make(map[int64]*threadAcc)
+	rootOrder := make([]int64, 0)
+	for _, id := range ids {
+		it, ok := items[id]
+		if !ok {
+			continue
+		}
+		rootID := it.RootID
+		if rootID == 0 {
+			rootID = id
+		}
+		acc, ok := byRoot[rootID]
+		if !ok {
+			acc = &threadAcc{rootID: rootID}
+			byRoot[rootID] = acc
+			rootOrder = append(rootOrder, rootID)
+		}
+		acc.hits = append(acc.hits, groupedHit{id: id, d2: d2ByID[id], item: it})
+	}
+
+	rootIDs := make([]int64, len(rootOrder))
+	copy(rootIDs, rootOrder)
+	roots, err := s.store.fetchRootsByIDs(ctx, rootIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	threads := make([]threadResult, 0, len(byRoot))
+	for _, rootID := range rootOrder {
+		acc := byRoot[rootID]
+		root := roots[rootID]
+		tr := threadResult{
+			Root: threadRoot{
+				ID:    strconv.FormatInt(rootID, 10),
+				Title: truncateTitle(root.Title),
+				Date:  formatHNDate(root.TS),
+				URL:   hnItemURL(rootID),
+			},
+			Score: threadLogSumExpScore(acc.hits, tau),
+			Hits:  []threadHit{},
+		}
+		sort.SliceStable(acc.hits, func(i, j int) bool {
+			if acc.hits[i].item.Depth != acc.hits[j].item.Depth {
+				return acc.hits[i].item.Depth < acc.hits[j].item.Depth
+			}
+			return acc.hits[i].id < acc.hits[j].id
+		})
+		for _, h := range acc.hits {
+			if h.item.Depth == 0 && h.id == rootID {
+				continue
+			}
+			hit := threadHit{
+				ID:           strconv.FormatInt(h.id, 10),
+				Depth:        h.item.Depth,
+				TitleSnippet: truncateTitle(h.item.Title),
+				D2:           h.d2,
+				URL:          hnItemURL(h.id),
+			}
+			if h.item.Type == "comment" && h.item.Text != "" {
+				hit.TextSnippet = truncateTextSnippet(h.item.Text)
+			}
+			tr.Hits = append(tr.Hits, hit)
+		}
+		threads = append(threads, tr)
+	}
+
+	sort.SliceStable(threads, func(i, j int) bool {
+		if threads[i].Score != threads[j].Score {
+			return threads[i].Score > threads[j].Score
+		}
+		return threads[i].Root.ID < threads[j].Root.ID
+	})
+	return threads, nil
+}
+
+// threadLogSumExpScore calcule tau*log(Σ exp(sim/tau)) avec sim=exp(-d²/tau).
+func threadLogSumExpScore(hits []groupedHit, tau float64) float64 {
+	var sum float64
+	for _, h := range hits {
+		sim := math.Exp(-h.d2 / tau)
+		sum += math.Exp(sim / tau)
+	}
+	if sum <= 0 {
+		return 0
+	}
+	return tau * math.Log(sum)
+}
+
+// handleItem rend les métadonnées et le texte d'un item depuis le magasin local.
+func (s *server) handleItem(w http.ResponseWriter, r *http.Request) {
+	if s.warmingGate(w) {
+		return
+	}
+	ip := clientIP(r, s.trustProxy)
+	if !s.lim.allow(ip) {
+		s.writeError(w, http.StatusTooManyRequests, "too many requests")
+		return
+	}
+
+	idStr := strings.TrimSpace(r.URL.Query().Get("id"))
+	if idStr == "" {
+		s.writeError(w, http.StatusBadRequest, "missing id parameter")
+		return
+	}
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		s.writeError(w, http.StatusBadRequest, "invalid id parameter")
+		return
+	}
+
+	if s.store == nil {
+		s.writeError(w, http.StatusServiceUnavailable, "title store unavailable")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), s.reqTimeout)
+	defer cancel()
+
+	it, ok, err := s.store.itemByID(ctx, id)
+	if err != nil {
+		s.log.Error("item lookup failed", "ip", ip, "id", id, "err", err.Error())
+		s.writeError(w, http.StatusInternalServerError, "item unavailable")
+		return
+	}
+	if !ok {
+		s.writeError(w, http.StatusNotFound, "item not found")
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, itemResponse{
+		ID:    strconv.FormatInt(it.ID, 10),
+		Title: it.Title,
+		Text:  it.Text,
+		Type:  it.Type,
+		Date:  formatHNDate(it.TS),
+		URL:   hnItemURL(it.ID),
+	})
 }
 
 // handlePreview rend un aperçu Open Graph de l'URL cible externe d'un item, que le navigateur ne

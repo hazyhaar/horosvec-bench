@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"math"
@@ -11,9 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +42,65 @@ func (s *sliceIter) Reset() error { s.pos = 0; return nil }
 
 // buildTestIndex construit un index horosvec réel (chemin arène) de dimension embedDim sur n
 // vecteurs unitaires, et retourne l'index ouvert prêt à servir ainsi que le premier vecteur.
+// hnSliceIter assigne des ext_id HN explicites (chaîne décimale) aux vecteurs de test.
+type hnSliceIter struct {
+	ids  []string
+	vecs [][]float32
+	pos  int
+}
+
+func (s *hnSliceIter) Next() (id []byte, vec []float32, ok bool) {
+	if s.pos >= len(s.vecs) {
+		return nil, nil, false
+	}
+	i := s.pos
+	s.pos++
+	return []byte(s.ids[i]), s.vecs[i], true
+}
+
+func (s *hnSliceIter) Reset() error { s.pos = 0; return nil }
+
+func buildStoreMatchedIndex(t *testing.T) (*horosvec.Index, []float32) {
+	t.Helper()
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, "index.db")
+	arenaPath := filepath.Join(dir, "corpus.arena")
+	db, err := sql.Open("sqlite", indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := horosvec.DefaultConfig()
+	cfg.ArenaPath = arenaPath
+	idx, err := horosvec.New(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{"1000", "1001", "1002", "2000", "3000", "3001"}
+	rng := rand.New(rand.NewPCG(20260713, 3))
+	vecs := make([][]float32, len(ids))
+	for i := range vecs {
+		v := make([]float32, embedDim)
+		var norm float64
+		for j := range v {
+			v[j] = float32(rng.NormFloat64())
+			norm += float64(v[j]) * float64(v[j])
+		}
+		inv := float32(1.0 / math.Sqrt(norm))
+		for j := range v {
+			v[j] *= inv
+		}
+		vecs[i] = v
+	}
+	if err := idx.Build(context.Background(), &hnSliceIter{ids: ids, vecs: vecs}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = idx.Close()
+		_ = db.Close()
+	})
+	return idx, vecs[0]
+}
+
 func buildTestIndex(t *testing.T, n int) (*horosvec.Index, []float32) {
 	t.Helper()
 	dir := t.TempDir()
@@ -95,21 +155,102 @@ func fakeSidecar(t *testing.T, vec []float32) *httptest.Server {
 	return srv
 }
 
-func newTestServer(t *testing.T, idx *horosvec.Index, embedURL string, rate, burst float64) *server {
+func newTestServer(t *testing.T, idx searcher, store *titleStore, embedURL string, rate, burst float64) *server {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	s := &server{
 		embed:      &embedClient{url: embedURL, hc: &http.Client{Timeout: 2 * time.Second}},
+		store:      store,
 		lim:        newIPLimiter(ctx, rate, burst),
 		reqTimeout: 5 * time.Second,
 		topK:       10,
+		kRaw:       300,
+		tau:        0.1,
 		html:       []byte("<html></html>"),
 		warming:    []byte("<html>warming</html>"),
 		log:        slog.New(slog.NewJSONHandler(io.Discard, nil)),
 	}
 	s.setIndex(idx)
 	return s
+}
+
+// fakeSearcher renvoie des hits vectoriels connus (tests de regroupement/score).
+type fakeSearcher struct {
+	hits []horosvec.Result
+}
+
+func (f *fakeSearcher) Search(_ context.Context, _ []float32, topK int) ([]horosvec.Result, error) {
+	n := topK
+	if n > len(f.hits) {
+		n = len(f.hits)
+	}
+	return f.hits[:n], nil
+}
+
+// errSearcher simule un sous-index qui échoue à la recherche.
+type errSearcher struct {
+	err error
+}
+
+func (e *errSearcher) Search(context.Context, []float32, int) ([]horosvec.Result, error) {
+	if e.err == nil {
+		return nil, errors.New("search failed")
+	}
+	return nil, e.err
+}
+
+func buildTestStore(t *testing.T) *titleStore {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	longText := strings.Repeat("α", 150) + " &lt;end&gt;"
+	ddl := `
+CREATE TABLE item(
+  id INTEGER PRIMARY KEY,
+  ts INTEGER,
+  type TEXT,
+  title TEXT,
+  parent INTEGER,
+  root_id INTEGER,
+  depth INTEGER,
+  orphan INTEGER DEFAULT 0,
+  text TEXT
+);`
+	if _, err := db.Exec(ddl); err != nil {
+		t.Fatal(err)
+	}
+	rows := []struct {
+		id, ts, parent, root, depth, orphan int64
+		typ, title, text                    string
+	}{
+		{1000, 1609459200, 0, 1000, 0, 0, "story", "Story Alpha", ""},
+		{1001, 1609459300, 1000, 1000, 1, 0, "comment", "Comment one", longText},
+		{1002, 1609459400, 1001, 1000, 2, 0, "comment", "Comment two", "Short reply &amp; done"},
+		{2000, 1609545600, 0, 2000, 0, 0, "story", "Orphan story", ""},
+		{3000, 1609632000, 0, 3000, 0, 0, "story", "Story Beta", ""},
+		{3001, 1609632100, 3000, 3000, 1, 0, "comment", "Beta comment only", "Beta body text"},
+	}
+	for _, r := range rows {
+		_, err := db.Exec(`INSERT INTO item(id,ts,type,title,parent,root_id,depth,orphan,text) VALUES(?,?,?,?,?,?,?,?,?)`,
+			r.id, r.ts, r.typ, r.title, r.parent, r.root, r.depth, r.orphan, r.text)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openTitleStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
 }
 
 func doSearch(t *testing.T, srv *server, q string) *http.Response {
@@ -120,13 +261,107 @@ func doSearch(t *testing.T, srv *server, q string) *http.Response {
 	return rec.Result()
 }
 
-// doSearchK est la variante de doSearch qui transmet le paramètre k (nombre de voisins demandés).
-func doSearchK(t *testing.T, srv *server, q, k string) *http.Response {
+func decodeSearch(t *testing.T, resp *http.Response) searchResponse {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "/api/search?q="+url.QueryEscape(q)+"&k="+url.QueryEscape(k), nil)
-	rec := httptest.NewRecorder()
-	srv.handleSearch(rec, req)
-	return rec.Result()
+	var out searchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestFederatedMerge vérifie la fusion k_raw par index : tri d², dédup ext_id, hits monolithe+shard.
+func TestFederatedMerge(t *testing.T) {
+	mono := &fakeSearcher{hits: []horosvec.Result{
+		{ID: []byte("1000"), Score: 0.5},
+		{ID: []byte("1001"), Score: 0.3},
+	}}
+	shard := &fakeSearcher{hits: []horosvec.Result{
+		{ID: []byte("9000"), Score: 0.2},
+		{ID: []byte("1001"), Score: 0.9},
+	}}
+	fs := newFederatedSearcher(slog.New(slog.NewJSONHandler(io.Discard, nil)), []labeledSearcher{
+		{label: "monolith", s: mono},
+		{label: "shard", s: shard},
+	})
+	got, err := fs.Search(context.Background(), nil, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("hits %d != 3", len(got))
+	}
+	want := []struct {
+		id string
+		d2 float64
+	}{
+		{"9000", 0.2},
+		{"1001", 0.3},
+		{"1000", 0.5},
+	}
+	for i, w := range want {
+		if string(got[i].ID) != w.id || got[i].Score != w.d2 {
+			t.Fatalf("rang %d: %+v, attendu id=%s d2=%v", i, got[i], w.id, w.d2)
+		}
+	}
+	indices := fs.LastIndices()
+	if len(indices) != 2 || indices[0] != "monolith" || indices[1] != "shard" {
+		t.Fatalf("indices = %v", indices)
+	}
+}
+
+// TestFederatedDegradation vérifie qu'un sous-searcher en erreur est sauté et signalé.
+func TestFederatedDegradation(t *testing.T) {
+	fs := newFederatedSearcher(slog.New(slog.NewJSONHandler(io.Discard, nil)), []labeledSearcher{
+		{label: "monolith", s: &fakeSearcher{hits: []horosvec.Result{{ID: []byte("1000"), Score: 0.1}}}},
+		{label: "broken", s: &errSearcher{err: errors.New("index unavailable")}},
+	})
+	got, err := fs.Search(context.Background(), nil, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || string(got[0].ID) != "1000" {
+		t.Fatalf("résultat inattendu: %+v", got)
+	}
+	if skipped := fs.LastSkipped(); len(skipped) != 1 || skipped[0] != "broken" {
+		t.Fatalf("skipped = %v, attendu [broken]", skipped)
+	}
+}
+
+// TestFederatedDedup vérifie qu'un même ext_id dans deux index ne garde que le plus petit d².
+func TestFederatedDedup(t *testing.T) {
+	fs := newFederatedSearcher(slog.New(slog.NewJSONHandler(io.Discard, nil)), []labeledSearcher{
+		{label: "a", s: &fakeSearcher{hits: []horosvec.Result{{ID: []byte("42"), Score: 0.8}}}},
+		{label: "b", s: &fakeSearcher{hits: []horosvec.Result{{ID: []byte("42"), Score: 0.2}}}},
+	})
+	got, err := fs.Search(context.Background(), nil, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Score != 0.2 {
+		t.Fatalf("dédup: %+v", got)
+	}
+}
+
+// TestFederatedSearchAPI expose indices/skipped dans la réponse JSON.
+func TestFederatedSearchAPI(t *testing.T) {
+	store := buildTestStore(t)
+	fs := newFederatedSearcher(slog.New(slog.NewJSONHandler(io.Discard, nil)), []labeledSearcher{
+		{label: "monolith", s: &fakeSearcher{hits: []horosvec.Result{{ID: []byte("1001"), Score: 0.1}}}},
+		{label: "shard", s: &fakeSearcher{hits: []horosvec.Result{{ID: []byte("3001"), Score: 0.2}}}},
+	})
+	side := fakeSidecar(t, make([]float32, embedDim))
+	srv := newTestServer(t, fs, store, side.URL, 100, 100)
+
+	resp := doSearch(t, srv, "requête")
+	defer resp.Body.Close()
+	out := decodeSearch(t, resp)
+	if len(out.Indices) != 2 || out.Indices[0] != "monolith" || out.Indices[1] != "shard" {
+		t.Fatalf("indices = %v", out.Indices)
+	}
+	if len(out.Threads) < 1 {
+		t.Fatal("aucun fil rendu")
+	}
 }
 
 // TestParseTopK vérifie la résolution et l'écrêtage du paramètre k au niveau unitaire.
@@ -153,55 +388,27 @@ func TestParseTopK(t *testing.T) {
 	}
 }
 
-// TestSearchKCap vérifie de bout en bout que k demandé au-delà du plafond est écrêté à maxTopK
-// sans erreur, et qu'un k dans la borne est honoré.
-func TestSearchKCap(t *testing.T) {
-	idx, q0 := buildTestIndex(t, 300)
-	side := fakeSidecar(t, q0)
-	srv := newTestServer(t, idx, side.URL, 100, 100)
-
-	resp := doSearchK(t, srv, "sujet de test", "60")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("k=60: statut %d != 200", resp.StatusCode)
-	}
-	var out searchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	if len(out.Results) != 60 {
-		t.Fatalf("k=60: résultats %d != 60", len(out.Results))
-	}
-
-	resp = doSearchK(t, srv, "sujet de test", "500")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("k=500: statut %d != 200", resp.StatusCode)
-	}
-	var capped searchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&capped); err != nil {
-		t.Fatal(err)
-	}
-	if len(capped.Results) != maxTopK {
-		t.Fatalf("k=500: résultats %d != %d (écrêtage attendu)", len(capped.Results), maxTopK)
-	}
-}
-
-// TestSearchOK vérifie qu'une recherche nominale rend un top-K non vide, une latence
-// renseignée, et l'ext_id du corpus (le plus proche du vecteur d'un item est l'item lui-même).
+// TestSearchOK vérifie qu'une recherche nominale rend des fils, la fraîcheur, et une latence.
 func TestSearchOK(t *testing.T) {
-	idx, q0 := buildTestIndex(t, 300)
-	side := fakeSidecar(t, q0)
-	srv := newTestServer(t, idx, side.URL, 100, 100)
+	store := buildTestStore(t)
+	fs := &fakeSearcher{hits: []horosvec.Result{
+		{ID: []byte("1001"), Score: 0.2},
+		{ID: []byte("3001"), Score: 0.5},
+	}}
+	side := fakeSidecar(t, make([]float32, embedDim))
+	srv := newTestServer(t, fs, store, side.URL, 100, 100)
 
 	resp := doSearch(t, srv, "sujet de test")
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("statut %d != 200", resp.StatusCode)
 	}
-	var out searchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatal(err)
+	out := decodeSearch(t, resp)
+	if len(out.Threads) != 2 {
+		t.Fatalf("threads %d != 2", len(out.Threads))
 	}
-	if len(out.Results) != 10 {
-		t.Fatalf("résultats %d != 10", len(out.Results))
+	if out.Freshness == "" {
+		t.Fatal("freshness manquante")
 	}
 	if out.LatencyMS <= 0 {
 		t.Fatalf("latence non renseignée: %.3f", out.LatencyMS)
@@ -209,16 +416,13 @@ func TestSearchOK(t *testing.T) {
 	if out.EmbedMS < 0 {
 		t.Fatalf("embed_ms négatif: %.3f", out.EmbedMS)
 	}
-	if out.Results[0].ID != "0" {
-		t.Fatalf("plus proche de q0 = %q, attendu \"0\"", out.Results[0].ID)
-	}
 }
 
 // TestRateLimit vérifie que le limiteur déclenche un 429 une fois le burst épuisé.
 func TestRateLimit(t *testing.T) {
 	idx, q0 := buildTestIndex(t, 100)
 	side := fakeSidecar(t, q0)
-	srv := newTestServer(t, idx, side.URL, 0.001, 5) // burst 5, régénération négligeable
+	srv := newTestServer(t, idx, buildTestStore(t), side.URL, 0.001, 5) // burst 5, régénération négligeable
 
 	got429 := false
 	for i := 0; i < 12; i++ {
@@ -242,7 +446,7 @@ func TestSidecarDown(t *testing.T) {
 	deadURL := side.URL
 	side.Close() // ferme le sidecar : connexion refusée
 
-	srv := newTestServer(t, idx, deadURL, 100, 100)
+	srv := newTestServer(t, idx, buildTestStore(t), deadURL, 100, 100)
 	resp := doSearch(t, srv, "requête")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
@@ -254,7 +458,7 @@ func TestSidecarDown(t *testing.T) {
 func TestQueryBounds(t *testing.T) {
 	idx, q0 := buildTestIndex(t, 50)
 	side := fakeSidecar(t, q0)
-	srv := newTestServer(t, idx, side.URL, 100, 100)
+	srv := newTestServer(t, idx, buildTestStore(t), side.URL, 100, 100)
 
 	resp := doSearch(t, srv, "")
 	_ = resp.Body.Close()
@@ -273,45 +477,16 @@ func TestQueryBounds(t *testing.T) {
 	}
 }
 
-// TestLoadTitles vérifie le chargement, la troncature et le repli map nil.
-func TestLoadTitles(t *testing.T) {
-	if m, err := loadTitles(""); err != nil || m != nil {
-		t.Fatalf("chemin vide: map=%v err=%v (attendu nil,nil)", m, err)
+// TestTruncateTitle vérifie la troncature à l'ellipse.
+func TestTruncateTitle(t *testing.T) {
+	long := strings.Repeat("x", maxTitleLen+50)
+	got := truncateTitle(long)
+	r := []rune(got)
+	if len(r) != maxTitleLen+1 || r[len(r)-1] != '…' {
+		t.Fatalf("troncature incorrecte: %d runes", len(r))
 	}
-	dir := t.TempDir()
-	p := filepath.Join(dir, "titles.tsv")
-	long := ""
-	for i := 0; i < maxTitleLen+50; i++ {
-		long += "x"
-	}
-	content := "123\tUn titre HN\n456\t" + long + "\n\n789\t  \n"
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	m, err := loadTitles(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if m["123"] != "Un titre HN" {
-		t.Fatalf("titre 123 = %q", m["123"])
-	}
-	if r := []rune(m["456"]); len(r) != maxTitleLen+1 || r[len(r)-1] != '…' {
-		t.Fatalf("titre 456 non tronqué à l'ellipse: %d runes", len(r))
-	}
-	if _, ok := m["789"]; ok {
-		t.Fatal("ligne à titre vide indûment retenue")
-	}
-}
-
-// TestLoadTitlesMalformed vérifie l'échec fail-loud sur ligne sans tabulation.
-func TestLoadTitlesMalformed(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, "bad.tsv")
-	if err := os.WriteFile(p, []byte("pas_de_tabulation_ici\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadTitles(p); err == nil {
-		t.Fatal("attendu une erreur sur ligne sans tabulation")
+	if truncateTitle("court") != "court" {
+		t.Fatal("titre court modifié")
 	}
 }
 
@@ -330,21 +505,119 @@ func TestIndexPage(t *testing.T) {
 	}
 }
 
-// TestTitleSnippetInResults vérifie que le titre chargé est restitué dans la réponse.
-func TestTitleSnippetInResults(t *testing.T) {
-	idx, q0 := buildTestIndex(t, 120)
-	side := fakeSidecar(t, q0)
-	srv := newTestServer(t, idx, side.URL, 100, 100)
-	srv.titles = map[string]string{"0": "Titre de l'item zéro"}
+// TestThreadGroupingScore vérifie le regroupement par root_id et le score log-somme-exp.
+func TestThreadGroupingScore(t *testing.T) {
+	store := buildTestStore(t)
+	fs := &fakeSearcher{hits: []horosvec.Result{
+		{ID: []byte("1001"), Score: 0.1},
+		{ID: []byte("1002"), Score: 0.2},
+		{ID: []byte("2000"), Score: 0.1},
+		{ID: []byte("3001"), Score: 0.4},
+	}}
+	side := fakeSidecar(t, make([]float32, embedDim))
+	srv := newTestServer(t, fs, store, side.URL, 100, 100)
 
 	resp := doSearch(t, srv, "requête")
 	defer resp.Body.Close()
-	var out searchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	out := decodeSearch(t, resp)
+	if len(out.Threads) != 3 {
+		t.Fatalf("threads %d != 3", len(out.Threads))
+	}
+	if out.Threads[0].Root.ID != "1000" {
+		t.Fatalf("premier fil = %s, attendu 1000 (2 hits forts)", out.Threads[0].Root.ID)
+	}
+	if len(out.Threads[0].Hits) != 2 {
+		t.Fatalf("hits fil 1000 = %d, attendu 2", len(out.Threads[0].Hits))
+	}
+	single := 0.0
+	double := 0.0
+	for _, th := range out.Threads {
+		switch th.Root.ID {
+		case "1000":
+			double = th.Score
+		case "2000":
+			single = th.Score
+		}
+	}
+	if double <= single {
+		t.Fatalf("fil 2 hits (%.4f) doit battre fil 1 hit même d² (%.4f)", double, single)
+	}
+}
+
+// TestThreadRootTitleWithoutStoryHit vérifie le titre racine joint sans hit story.
+func TestThreadRootTitleWithoutStoryHit(t *testing.T) {
+	store := buildTestStore(t)
+	fs := &fakeSearcher{hits: []horosvec.Result{{ID: []byte("3001"), Score: 0.3}}}
+	side := fakeSidecar(t, make([]float32, embedDim))
+	srv := newTestServer(t, fs, store, side.URL, 100, 100)
+
+	resp := doSearch(t, srv, "requête")
+	defer resp.Body.Close()
+	out := decodeSearch(t, resp)
+	if len(out.Threads) != 1 {
+		t.Fatalf("threads %d != 1", len(out.Threads))
+	}
+	if out.Threads[0].Root.Title != "Story Beta" {
+		t.Fatalf("titre racine = %q, attendu Story Beta", out.Threads[0].Root.Title)
+	}
+	if out.Threads[0].Root.URL != "https://news.ycombinator.com/item?id=3000" {
+		t.Fatalf("url racine incorrecte: %s", out.Threads[0].Root.URL)
+	}
+}
+
+// TestAPISearchSmokeJSON expose la réponse /api/search (preuve locale type curl).
+func TestAPISearchSmokeJSON(t *testing.T) {
+	store := buildTestStore(t)
+	idx, q0 := buildStoreMatchedIndex(t)
+	side := fakeSidecar(t, q0)
+	srv := newTestServer(t, idx, store, side.URL, 100, 100)
+
+	ts := httptest.NewServer(srv.routes())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/api/search?q=machine+learning")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Results[0].ID != "0" || out.Results[0].TitleSnippet != "Titre de l'item zéro" {
-		t.Fatalf("snippet manquant: %+v", out.Results[0])
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("statut %d: %s", resp.StatusCode, body)
+	}
+	var pretty map[string]any
+	if err := json.Unmarshal(body, &pretty); err != nil {
+		t.Fatal(err)
+	}
+	enc, _ := json.MarshalIndent(pretty, "", "  ")
+	t.Logf("SMOKE /api/search JSON:\n%s", enc)
+}
+
+// TestThreadSingleBatchQueries vérifie exactement une requête IN par batch (pas N lookups).
+func TestThreadSingleBatchQueries(t *testing.T) {
+	store := buildTestStore(t)
+	fs := &fakeSearcher{hits: []horosvec.Result{
+		{ID: []byte("1001"), Score: 0.1},
+		{ID: []byte("1002"), Score: 0.2},
+		{ID: []byte("3001"), Score: 0.3},
+	}}
+	side := fakeSidecar(t, make([]float32, embedDim))
+	srv := newTestServer(t, fs, store, side.URL, 100, 100)
+	store.batchHits.Store(0)
+	store.batchRoot.Store(0)
+
+	resp := doSearch(t, srv, "requête")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("statut %d != 200", resp.StatusCode)
+	}
+	if got := store.batchHits.Load(); got != 1 {
+		t.Fatalf("requêtes batch hits = %d, attendu 1", got)
+	}
+	if got := store.batchRoot.Load(); got != 1 {
+		t.Fatalf("requêtes batch racines = %d, attendu 1", got)
 	}
 }
 
@@ -372,7 +645,7 @@ func TestClientIP(t *testing.T) {
 func TestHealthz(t *testing.T) {
 	idx, q0 := buildTestIndex(t, 50)
 	side := fakeSidecar(t, q0)
-	srv := newTestServer(t, idx, side.URL, 100, 100)
+	srv := newTestServer(t, idx, buildTestStore(t), side.URL, 100, 100)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 	srv.handleHealthz(rec, req)
@@ -438,8 +711,10 @@ func TestWarmingState(t *testing.T) {
 	}
 
 	// Bascule à prêt.
-	idx, _ := buildTestIndex(t, 50)
-	srv.setIndex(idx)
+	store := buildTestStore(t)
+	fs := &fakeSearcher{hits: []horosvec.Result{{ID: []byte("1000"), Score: 0.1}}}
+	srv.store = store
+	srv.setIndex(fs)
 
 	rec = httptest.NewRecorder()
 	srv.handleHealthz(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -451,6 +726,101 @@ func TestWarmingState(t *testing.T) {
 	srv.handleSearch(rec, httptest.NewRequest(http.MethodGet, "/api/search?q=x", nil))
 	if rec.Result().StatusCode != http.StatusOK {
 		t.Fatalf("/api/search une fois prêt: statut %d != 200", rec.Result().StatusCode)
+	}
+}
+
+// TestItemByID vérifie que itemByID restitue le texte stocké.
+func TestItemByID(t *testing.T) {
+	store := buildTestStore(t)
+	ctx := context.Background()
+
+	it, ok, err := store.itemByID(ctx, 1002)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("item 1002 not found")
+	}
+	if it.Text != "Short reply &amp; done" {
+		t.Fatalf("text = %q", it.Text)
+	}
+	if it.Title != "Comment two" {
+		t.Fatalf("title = %q", it.Title)
+	}
+}
+
+// TestAPIItemRoute vérifie GET /api/item?id=.
+func TestAPIItemRoute(t *testing.T) {
+	store := buildTestStore(t)
+	fs := &fakeSearcher{}
+	side := fakeSidecar(t, make([]float32, embedDim))
+	srv := newTestServer(t, fs, store, side.URL, 100, 100)
+
+	ts := httptest.NewServer(srv.routes())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/api/item?id=1002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("statut %d != 200", resp.StatusCode)
+	}
+	var out itemResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.ID != "1002" || out.Text != "Short reply &amp; done" {
+		t.Fatalf("réponse inattendue: %+v", out)
+	}
+	if out.URL != "https://news.ycombinator.com/item?id=1002" {
+		t.Fatalf("url = %q", out.URL)
+	}
+}
+
+// TestTextSnippetInSearch vérifie text_snippet décodé et tronqué sur les hits commentaires.
+func TestTextSnippetInSearch(t *testing.T) {
+	store := buildTestStore(t)
+	fs := &fakeSearcher{hits: []horosvec.Result{{ID: []byte("1001"), Score: 0.1}}}
+	side := fakeSidecar(t, make([]float32, embedDim))
+	srv := newTestServer(t, fs, store, side.URL, 100, 100)
+
+	resp := doSearch(t, srv, "requête")
+	defer resp.Body.Close()
+	out := decodeSearch(t, resp)
+	if len(out.Threads) != 1 {
+		t.Fatalf("threads %d != 1", len(out.Threads))
+	}
+	if len(out.Threads[0].Hits) != 1 {
+		t.Fatalf("hits %d != 1", len(out.Threads[0].Hits))
+	}
+	snip := out.Threads[0].Hits[0].TextSnippet
+	if snip == "" {
+		t.Fatal("text_snippet manquant")
+	}
+	r := []rune(snip)
+	if len(r) != maxTextSnippetLen+1 || r[len(r)-1] != '…' {
+		t.Fatalf("troncature incorrecte: %d runes", len(r))
+	}
+	if strings.Contains(snip, "&lt;") {
+		t.Fatalf("entités non décodées: %q", snip)
+	}
+}
+
+// TestTruncateTextSnippet vérifie le décodage HN et la borne à 140 runes.
+func TestTruncateTextSnippet(t *testing.T) {
+	raw := strings.Repeat("z", 200) + " &amp; done"
+	got := truncateTextSnippet(raw)
+	gr := []rune(got)
+	if len(gr) != maxTextSnippetLen+1 {
+		t.Fatalf("longueur %d != %d+1", len(gr), maxTextSnippetLen)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("pas d'ellipse: %q", got)
+	}
+	if strings.Contains(got, "&amp;") {
+		t.Fatal("entité non décodée")
 	}
 }
 

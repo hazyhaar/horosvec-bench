@@ -1,9 +1,8 @@
 package main
 
 import (
-	"bufio"
-	"fmt"
-	"os"
+	"html"
+	"regexp"
 	"strings"
 )
 
@@ -11,45 +10,14 @@ import (
 // qu'un extrait lisible, jamais un texte arbitrairement long.
 const maxTitleLen = 160
 
-// loadTitles charge un fichier optionnel de titres au format « id<TAB>titre » (une ligne par
-// item, séparateur tabulation). Un chemin vide retourne une map nil (la page affiche alors
-// l'id HN et son lien, repli assumé de la V1). Les titres sont tronqués à maxTitleLen.
-func loadTitles(path string) (map[string]string, error) {
-	if path == "" {
-		return nil, nil
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
+// maxTextSnippetLen borne l'aperçu inline d'un commentaire dans /api/search.
+const maxTextSnippetLen = 140
 
-	titles := make(map[string]string)
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	line := 0
-	for sc.Scan() {
-		line++
-		raw := sc.Text()
-		if raw == "" {
-			continue
-		}
-		id, title, ok := strings.Cut(raw, "\t")
-		if !ok {
-			return nil, fmt.Errorf("titres ligne %d : séparateur tabulation absent", line)
-		}
-		id = strings.TrimSpace(id)
-		title = strings.TrimSpace(title)
-		if id == "" || title == "" {
-			continue
-		}
-		titles[id] = truncateTitle(title)
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	return titles, nil
-}
+var hnParagraphRe = regexp.MustCompile(`(?i)</?p>`)
+
+// hnTagRe capture tout élément de balisage HN résiduel (<a href…>, <i>, <pre>, <code>…)
+// pour le retirer de l'aperçu : le texte brut lisible, jamais du markup affiché tel quel.
+var hnTagRe = regexp.MustCompile(`<[^>]+>`)
 
 // truncateTitle tronque un titre à maxTitleLen runes, en ajoutant une ellipse le cas échéant.
 func truncateTitle(s string) string {
@@ -58,4 +26,27 @@ func truncateTitle(s string) string {
 		return s
 	}
 	return string(r[:maxTitleLen]) + "…"
+}
+
+// decodeHNText convertit le balisage/entités HN en texte brut (anti-injection côté rendu).
+func decodeHNText(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	s := hnParagraphRe.ReplaceAllString(raw, "\n\n")
+	// Retirer le markup AVANT de déséchapper les entités : les balises sont littérales dans
+	// le texte HN (<a href="…">), tandis que &gt;/&quot; sont encodées — déséchapper d'abord
+	// ferait réapparaître des chevrons pris pour du balisage.
+	s = hnTagRe.ReplaceAllString(s, "")
+	return strings.TrimSpace(html.UnescapeString(s))
+}
+
+// truncateTextSnippet rend les premiers maxTextSnippetLen caractères du texte HN décodé.
+func truncateTextSnippet(raw string) string {
+	decoded := decodeHNText(raw)
+	r := []rune(decoded)
+	if len(r) <= maxTextSnippetLen {
+		return string(r)
+	}
+	return string(r[:maxTextSnippetLen]) + "…"
 }

@@ -9,3 +9,5 @@ hnbook-build
 hnbook-validate
 /hnbook-serve
 /data/
+/hnbook-fetch
+/hnbook-titles
